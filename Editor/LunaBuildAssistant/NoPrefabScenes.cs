@@ -58,9 +58,10 @@ namespace Supercent.Util.Editor
                 summary = "No scene is selected for Luna builds.";
                 return true;
             }
+            string startup = SourcePath(LunaPluginBridge.LunaStartupScene);
             if (!Enabled)
             {
-                LunaPluginBridge.SetLunaScenes(sources, sources.Select(CopyPath).Where(p => File.Exists(p)).ToList());
+                LunaPluginBridge.SetLunaScenes(sources, sources.Select(CopyPath).Where(p => File.Exists(p)).ToList(), startup);
                 summary = null;
                 return true;
             }
@@ -82,7 +83,7 @@ namespace Supercent.Util.Editor
                 lines.Add(Generate(source));
             List<string> copies = sources.Select(CopyPath).ToList();
             AddToBuildSettings(sources);
-            LunaPluginBridge.SetLunaScenes(copies, sources);
+            LunaPluginBridge.SetLunaScenes(copies, sources, CopyPath(startup));
             summary = string.Join("\n", lines);
             return true;
         }

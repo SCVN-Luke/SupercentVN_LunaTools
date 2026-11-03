@@ -107,17 +107,32 @@ namespace Supercent.Util.Editor
         public static List<string> LunaScenes =>
             Config() is object config ? ((IEnumerable)Field(Field(config, "unity"), "scenes") ?? new string[0]).Cast<string>().ToList() : new List<string>();
 
-        public static void SetLunaScenes(List<string> scenes, List<string> disabled)
+        // The scene the playable opens with (luna.json unity.startupScene, an index into unity.scenes).
+        public static string LunaStartupScene
+        {
+            get
+            {
+                List<string> scenes = LunaScenes;
+                if (scenes.Count == 0)
+                    return null;
+                int index = (int)Field(Field(Config(), "unity"), "startupScene");
+                return index >= 0 && index < scenes.Count ? scenes[index] : scenes[0];
+            }
+        }
+
+        public static void SetLunaScenes(List<string> scenes, List<string> disabled, string startup)
         {
             object config = Config() ?? throw new InvalidOperationException("LunaData (luna.json) not found");
             object unity = Field(config, "unity");
             var currentDisabled = ((IEnumerable)Field(unity, "disabledScenes") ?? new string[0]).Cast<string>().ToList();
             List<string> newDisabled = currentDisabled.Except(scenes).Union(disabled).ToList();
-            if (LunaScenes.SequenceEqual(scenes) && currentDisabled.OrderBy(s => s).SequenceEqual(newDisabled.OrderBy(s => s)))
+            int startupIndex = Math.Max(0, scenes.IndexOf(startup));
+            if (LunaScenes.SequenceEqual(scenes) && (int)Field(unity, "startupScene") == startupIndex
+                && currentDisabled.OrderBy(s => s).SequenceEqual(newDisabled.OrderBy(s => s)))
                 return;
             SetField(unity, "scenes", new List<string>(scenes));
             SetField(unity, "disabledScenes", newDisabled);
-            SetField(unity, "startupScene", 0);
+            SetField(unity, "startupScene", startupIndex);
             Call(Shapes.SaveConfig, null, SaveDefine);
         }
 

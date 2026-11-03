@@ -7,7 +7,7 @@ using UnityEngine;
 namespace Supercent.Util.Editor
 {
     // One window for the team's Luna cloud flow, laid out like the Playworks plugin (sidebar + pages):
-    //   Build Develop: [regenerate _NoPrefab scenes] -> Clear Build Cache -> Build Develop -> open the local
+    //   Build Develop: scene picker; [regenerate _NoPrefab scenes] -> Clear Build Cache -> Build Develop -> open the local
     //                  server in a browser -> the plugin's Size breakdown for the chosen network.
     //   Build & upload: pick app + concept -> stripped-code and Luna checks -> [regenerate _NoPrefab scenes]
     //                  -> clear SVC_Luna scene/runtime variants -> plugin's Build & upload.
@@ -40,9 +40,9 @@ namespace Supercent.Util.Editor
         readonly UploadChecksPanel checks = new UploadChecksPanel();
         readonly BuildSizeView sizeView = new BuildSizeView();
         readonly AssetSettingsView assetsView = new AssetSettingsView();
+        readonly ScenePickerPanel scenePicker = new ScenePickerPanel();
         [SerializeField] Page page;
         List<string> changes;
-        List<string> lunaScenes;
         double changesCheckedAt;
 
         [MenuItem("Tools/Luna/Build Assistant")]
@@ -68,6 +68,8 @@ namespace Supercent.Util.Editor
             appsRequested = false;
             checks.OnError = Fail;
             sizeView.Repaint = Repaint;
+            scenePicker.OnError = Fail;
+            scenePicker.Repaint = Repaint;
             checks.Invalidate();
         }
 
@@ -95,7 +97,8 @@ namespace Supercent.Util.Editor
             {
                 changesCheckedAt = EditorApplication.timeSinceStartup;
                 changes = ProjectBuildState.ChangesSincePrivateBuild();
-                lunaScenes = LunaPluginBridge.IsAvailable ? Safe(() => LunaPluginBridge.LunaScenes) : null;
+                if (LunaPluginBridge.IsAvailable)
+                    scenePicker.Refresh();
                 Repaint();
             }
             if (busy || loadingApps || loadingConcepts)
@@ -190,6 +193,9 @@ namespace Supercent.Util.Editor
                     GUILayout.Space(8);
                     using (new EditorGUILayout.VerticalScope())
                     {
+                        if (EditorGUILayout.LinkButton(new GUIContent("Open Unity Playworks Plugin", "The original plugin window: Playground sign-in and every advanced setting")))
+                            OpenPlayworks();
+                        GUILayout.Space(6);
                         if (showProgress || sizeView.Estimating)
                             DrawProgress();
                         else
@@ -249,6 +255,8 @@ namespace Supercent.Util.Editor
 
         static bool OpenBrowser => EditorPrefs.GetBool(OpenBrowserPref, true);
 
+        static void OpenPlayworks() => EditorApplication.ExecuteMenuItem(PlayworksMenu);
+
         void DrawPrivateBuild()
         {
             AssistantUI.Header("Build Develop",
@@ -268,6 +276,9 @@ namespace Supercent.Util.Editor
             }
             EditorGUILayout.Space(10);
 
+            scenePicker.Draw();
+            EditorGUILayout.Space(10);
+
             AssistantUI.SubHeader("Options");
             bool openBrowser = EditorGUILayout.ToggleLeft(new GUIContent("Open the browser when the build finishes"), OpenBrowser);
             if (openBrowser != OpenBrowser)
@@ -277,9 +288,9 @@ namespace Supercent.Util.Editor
                 "Smaller playable; keep editing the source scene."), NoPrefabScenes.Enabled);
             if (noPrefab != NoPrefabScenes.Enabled)
                 NoPrefabScenes.Enabled = noPrefab;
-            if (noPrefab && lunaScenes != null)
-                foreach (string scene in lunaScenes)
-                    GUILayout.Label("     → " + System.IO.Path.GetFileName(NoPrefabScenes.CopyPath(NoPrefabScenes.SourcePath(scene))), AssistantUI.Caption);
+            if (noPrefab && scenePicker.Selected != null)
+                foreach (string scene in scenePicker.Selected)
+                    GUILayout.Label("     → " + System.IO.Path.GetFileName(NoPrefabScenes.CopyPath(scene)), AssistantUI.Caption);
 
             EditorGUILayout.Space(14);
             if (AssistantUI.PrimaryButton("Clear Cache & Build Develop"))
@@ -297,7 +308,7 @@ namespace Supercent.Util.Editor
             {
                 EditorGUILayout.HelpBox("Sign in to Playground in the Unity Playworks Plugin first.", MessageType.Info);
                 if (GUILayout.Button("Open Unity Playworks Plugin", GUILayout.Width(200)))
-                    EditorApplication.ExecuteMenuItem(PlayworksMenu);
+                    OpenPlayworks();
                 return;
             }
 
