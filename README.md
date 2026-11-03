@@ -1,22 +1,29 @@
 # SupercentVN Luna Tools
 
-One shared copy of the Luna Build Assistant for every luna_* project on this machine.
+Luna Build Assistant (Tools/Luna/Build Assistant: Build Develop, Build & upload, pre-upload checks,
+build size, asset settings), Luna cache cleaner and Playground cookie fix, shared by the luna_*
+projects as a git submodule.
 
-## Use in a project
+## Add to a project
 
-Add to `Packages/manifest.json` (projects live at `Workspace/<project>/unity_project/<project>`):
+From the repository root (the Unity project is at `unity_project/<project>`):
 
-```json
-"com.supercentvn.lunatools": "file:../../../../Unity Packages/SupercentVN Luna Tools",
+```sh
+git submodule add https://github.com/SCVN-Luke/SupercentVN_LunaTools.git unity_project/<project>/Assets/SupercentVN/LunaTools
 ```
 
-Remove any old copy under `Assets/SupercentVN/Tools/Editor` first: the scripts keep their GUIDs.
+Delete any old copy under `Assets/SupercentVN/Tools/Editor` in the same step, before Unity
+refreshes: the scripts keep their GUIDs, and Unity re-GUIDs one side if it sees both copies.
+Commit the submodule, `.gitmodules` and `Assets/SupercentVN/LunaTools.meta`.
+
+Cloning a project: `git clone --recurse-submodules …`, or `git submodule update --init` afterwards.
 
 ## Changing the tool
 
-Edit it from any project (it shows under Packages/SupercentVN Luna Tools); every project that
-references the package gets the change on its next compile. Commit in this repository, not in the
-game project. Keep fixes generic: a problem met in one project usually hits the others too.
+Edit it inside any project (`Assets/SupercentVN/LunaTools`), then commit and push **in the
+submodule**, and commit the new submodule pointer in that project. Other projects get the change
+with `git submodule update --remote Assets/SupercentVN/LunaTools` (then commit their pointer).
+Keep fixes generic: a problem met in one project usually hits the others too.
 
-For someone without this folder: Window → Package Manager → + → Add package from tarball, with the
-.tgz made by `UnityEditor.PackageManager.Client.Pack`.
+The Editor asmdef stays `autoReferenced: false`: its `Supercent.Util.Editor` namespace would
+otherwise break `: Editor` base classes in project code.
