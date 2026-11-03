@@ -1,0 +1,8 @@
+{
+  "name": "com.supercentvn.lunatools",
+  "version": "1.0.0",
+  "displayName": "SupercentVN Luna Tools",
+  "description": "Luna Build Assistant (Tools/Luna/Build Assistant): Build Develop, Build & upload, pre-upload checks, build size and asset settings for the Unity Playworks plugin. Also Luna cache cleaner and Playground cookie fix.",
+  "unity": "2022.3",
+  "author": { "name": "SupercentVN" }
+}

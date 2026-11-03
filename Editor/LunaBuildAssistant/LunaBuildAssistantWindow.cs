@@ -1,0 +1,629 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using UnityEditor;
+using UnityEngine;
+
+namespace Supercent.Util.Editor
+{
+    // One window for the team's Luna cloud flow, laid out like the Playworks plugin (sidebar + pages):
+    //   Build Develop: [regenerate _NoPrefab scenes] -> Clear Build Cache -> Build Develop -> open the local
+    //                  server in a browser -> the plugin's Size breakdown for the chosen network.
+    //   Build & upload: pick app + concept -> stripped-code and Luna checks -> [regenerate _NoPrefab scenes]
+    //                  -> clear SVC_Luna scene/runtime variants -> plugin's Build & upload.
+    //   Checks / Build size: the details behind the pre-upload checks and the size report.
+    //   Assets: the plugin's Assets section (include/exclude lists, default and per-asset export settings).
+    public class LunaBuildAssistantWindow : EditorWindow
+    {
+        const string OpenBrowserPref = "SupercentVN.LunaBuildAssistant.OpenBrowser";
+        const string PlayworksMenu = "Tools/Unity Playworks Plugin";
+        const string NewConceptLabel = "< New Concept >";
+        const int MaxListedChanges = 10;
+        const float SidebarWidth = 190f;
+        const float ContentMargin = 12f;                    // Space on each side of the page content.
+        const double ChangesInterval = 3.0;                 // Seconds between scans for files changed since the last Build Develop.
+
+        enum Page { Private, Upload, Checks, Size, Assets }
+
+        LunaPluginBridge.App[] apps = new LunaPluginBridge.App[0];
+        LunaPluginBridge.Concept[] concepts = new LunaPluginBridge.Concept[0];
+        int appIndex;
+        int conceptIndex;                   // 0 = new concept, otherwise concepts[conceptIndex - 1].
+        string conceptName = string.Empty;
+        string suffix = string.Empty;
+        bool conceptNameEdited;
+        string branch;
+        bool appsRequested, loadingApps, loadingConcepts, building, showProgress;
+        int conceptsRequest;
+        string status;
+        Vector2 scroll;
+        readonly UploadChecksPanel checks = new UploadChecksPanel();
+        readonly BuildSizeView sizeView = new BuildSizeView();
+        readonly AssetSettingsView assetsView = new AssetSettingsView();
+        [SerializeField] Page page;
+        List<string> changes;
+        List<string> lunaScenes;
+        double changesCheckedAt;
+
+        [MenuItem("Tools/Luna/Build Assistant")]
+        static void Open() => Open(null);
+
+        [MenuItem("Tools/Luna/Build Size Report")]
+        static void OpenSize() => Open(Page.Size);
+
+        [MenuItem("Tools/Luna/Asset Settings")]
+        static void OpenAssets() => Open(Page.Assets);
+
+        static void Open(Page? target)
+        {
+            var window = GetWindow<LunaBuildAssistantWindow>("Luna Build Assistant");
+            window.minSize = new Vector2(900, 560);
+            if (target.HasValue)
+                window.page = target.Value;
+        }
+
+        void OnEnable()
+        {
+            branch = ProjectBuildState.CurrentBranch();
+            appsRequested = false;
+            checks.OnError = Fail;
+            sizeView.Repaint = Repaint;
+            checks.Invalidate();
+        }
+
+        void OnFocus() => assetsView.Reload();
+
+        void OnDisable()
+        {
+            sizeView.Close();
+        }
+
+        void OnInspectorUpdate()
+        {
+            // Load once signed in; kept out of OnGUI so the layout never changes mid-event.
+            if (!appsRequested && LunaPluginBridge.IsAvailable && SafeIsSignedIn())
+            {
+                appsRequested = true;
+                RefreshApps();
+            }
+            bool busy = building || SafeIsBuilding();
+            if (sizeView.Update())
+                Repaint();
+            if (!busy && LunaPluginBridge.IsAvailable && checks.Refresh())
+                Repaint();
+            if (!busy && EditorApplication.timeSinceStartup - changesCheckedAt > ChangesInterval)
+            {
+                changesCheckedAt = EditorApplication.timeSinceStartup;
+                changes = ProjectBuildState.ChangesSincePrivateBuild();
+                lunaScenes = LunaPluginBridge.IsAvailable ? Safe(() => LunaPluginBridge.LunaScenes) : null;
+                Repaint();
+            }
+            if (busy || loadingApps || loadingConcepts)
+                Repaint();
+        }
+
+        void OnGUI()
+        {
+            // Decided on Layout only, so Layout and Repaint always see the same controls.
+            if (Event.current.type == EventType.Layout)
+                showProgress = LunaPluginBridge.IsAvailable && (building || SafeIsBuilding());
+
+            // position includes the window's tab strip; fill exactly the area below it.
+            float height = position.height - (GUIUtility.GUIToScreenPoint(Vector2.zero).y - position.y);
+            using (new EditorGUILayout.HorizontalScope(GUILayout.Height(height)))
+            {
+                DrawSidebar();
+                GUILayout.Space(ContentMargin);
+                using (new EditorGUILayout.VerticalScope())
+                {
+                    GUILayout.Space(8);
+                    if (DrawPluginState())
+                    {
+                        switch (page)
+                        {
+                            case Page.Checks:
+                                checks.Draw();
+                                break;
+                            case Page.Size:
+                                sizeView.AvailableWidth = position.width - SidebarWidth - 2 * ContentMargin;
+                                sizeView.Draw();
+                                break;
+                            case Page.Assets:
+                                using (new EditorGUI.DisabledScope(showProgress))
+                                    assetsView.Draw();
+                                break;
+                            default:
+                                scroll = EditorGUILayout.BeginScrollView(scroll);
+                                using (new EditorGUI.DisabledScope(showProgress))
+                                {
+                                    if (page == Page.Private)
+                                        DrawPrivateBuild();
+                                    else
+                                        DrawUpload();
+                                }
+                                EditorGUILayout.EndScrollView();
+                                break;
+                        }
+                    }
+                    if (!string.IsNullOrEmpty(status))
+                    {
+                        AssistantUI.Separator();
+                        GUILayout.Label(new GUIContent(status, status), AssistantUI.Caption);
+                    }
+                    GUILayout.Space(6);
+                }
+                GUILayout.Space(ContentMargin);
+            }
+        }
+
+        // Plugin-style navigation: title, pages with warning badges, build progress at the bottom.
+        void DrawSidebar()
+        {
+            using (var side = new EditorGUILayout.VerticalScope(GUILayout.Width(SidebarWidth), GUILayout.ExpandHeight(true)))
+            {
+                if (Event.current.type == EventType.Repaint)
+                    EditorGUI.DrawRect(side.rect, AssistantUI.Sidebar);
+                GUILayout.Space(18);
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    GUILayout.Space(18);
+                    using (new EditorGUILayout.VerticalScope())
+                    {
+                        GUILayout.Label("Build Assistant", AssistantUI.Logo);
+                        string version = "Playworks " + (LunaPluginBridge.Version ?? "?");
+                        bool tested = LunaPluginBridge.IsAvailable && LunaPluginBridge.IsTestedVersion;
+                        GUILayout.Label(new GUIContent(version + (tested ? string.Empty : "  (untested)"),
+                            "Tested with " + string.Join(", ", LunaPluginBridge.TestedVersions)), AssistantUI.Caption);
+                    }
+                }
+                GUILayout.Space(22);
+
+                Nav(Page.Private, "Build Develop", 0);
+                Nav(Page.Upload, "Build & upload", 0);
+                Nav(Page.Checks, "Checks", checks.IssueCount);
+                Nav(Page.Size, "Build size", 0);
+                Nav(Page.Assets, "Assets", 0);
+                GUILayout.FlexibleSpace();
+
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    GUILayout.Space(8);
+                    using (new EditorGUILayout.VerticalScope())
+                    {
+                        if (showProgress || sizeView.Estimating)
+                            DrawProgress();
+                        else
+                            using (new EditorGUI.DisabledScope(!LunaPluginBridge.IsAvailable))
+                                if (AssistantUI.PrimaryButton("Build Develop", 26))
+                                    BuildPrivate(OpenBrowser);
+                    }
+                    GUILayout.Space(8);
+                }
+                GUILayout.Space(8);
+            }
+        }
+
+        void Nav(Page target, string text, int badge)
+        {
+            if (AssistantUI.NavButton(text, page == target, badge) && (page != Page.Assets || target == Page.Assets || assetsView.ConfirmLeave()))
+            {
+                if (target == Page.Assets)
+                    assetsView.Reload();
+                page = target;
+                GUI.FocusControl(null);
+            }
+        }
+
+        // Blocking errors replace the page; false when the tool cannot be used.
+        bool DrawPluginState()
+        {
+            if (LunaPluginBridge.IsAvailable)
+                return true;
+            AssistantUI.Header("Plugin not supported");
+            EditorGUILayout.HelpBox(LunaPluginBridge.BlockedReason, MessageType.Error);
+            if (GUILayout.Button("Retry", GUILayout.Width(80)))
+            {
+                LunaPluginBridge.Reset();
+                appsRequested = false;
+            }
+            return false;
+        }
+
+        void DrawProgress()
+        {
+            string label = null;
+            float fraction = 0f;
+            try
+            {
+                LunaPluginBridge.TryGetProgress(out label, out fraction);
+            }
+            catch (Exception e)
+            {
+                Fail(e);
+            }
+            GUILayout.Label(string.IsNullOrEmpty(label) ? "Building…" : label, AssistantUI.Caption);
+            Rect bar = GUILayoutUtility.GetRect(0, 6, GUILayout.ExpandWidth(true));
+            EditorGUI.DrawRect(bar, AssistantUI.Track);
+            EditorGUI.DrawRect(new Rect(bar.x, bar.y, bar.width * fraction, bar.height), AssistantUI.Accent);
+        }
+
+        static bool OpenBrowser => EditorPrefs.GetBool(OpenBrowserPref, true);
+
+        void DrawPrivateBuild()
+        {
+            AssistantUI.Header("Build Develop",
+                "Clear Build Cache → Build Develop → open the local server → size breakdown.\n\n" +
+                "Play every path here: Luna strips code that never runs in Build Develop from the cloud build.");
+
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                DateTime? last = ProjectBuildState.LastPrivateBuildUtc;
+                AssistantUI.Tile("Last build", last.HasValue ? AssistantUI.Ago(last.Value.ToLocalTime()) : "never", null, null,
+                                 last.HasValue ? last.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm") : null);
+                BuildSizeReport.Snapshot size = BuildSizeReport.Latest;
+                long delta = size == null || BuildSizeReport.Previous == null ? 0 : size.totalBytes - BuildSizeReport.Previous.totalBytes;
+                AssistantUI.Tile("Size · " + NetworkName(BuildSizeReport.Network), size == null ? "—" : BuildSizeReport.FormatBytes(size.totalBytes),
+                                 delta == 0 ? null : BuildSizeReport.FormatDelta(delta), AssistantUI.DeltaColor(delta), "Size breakdown of the playable; details in Build size");
+                AssistantUI.Tile("Changed since", changes == null ? "…" : changes.Count == 0 ? "none" : changes.Count + " file(s)", null, null, ChangesTooltip());
+            }
+            EditorGUILayout.Space(10);
+
+            AssistantUI.SubHeader("Options");
+            bool openBrowser = EditorGUILayout.ToggleLeft(new GUIContent("Open the browser when the build finishes"), OpenBrowser);
+            if (openBrowser != OpenBrowser)
+                EditorPrefs.SetBool(OpenBrowserPref, openBrowser);
+            bool noPrefab = EditorGUILayout.ToggleLeft(new GUIContent($"Build unpacked-prefab scenes (<Scene>{NoPrefabScenes.Suffix})",
+                "Before every build, the Luna scenes are copied to <Scene>_NoPrefab with every prefab unpacked, and the copies are built.\n" +
+                "Smaller playable; keep editing the source scene."), NoPrefabScenes.Enabled);
+            if (noPrefab != NoPrefabScenes.Enabled)
+                NoPrefabScenes.Enabled = noPrefab;
+            if (noPrefab && lunaScenes != null)
+                foreach (string scene in lunaScenes)
+                    GUILayout.Label("     → " + System.IO.Path.GetFileName(NoPrefabScenes.CopyPath(NoPrefabScenes.SourcePath(scene))), AssistantUI.Caption);
+
+            EditorGUILayout.Space(14);
+            if (AssistantUI.PrimaryButton("Clear Cache & Build Develop"))
+                BuildPrivate(openBrowser);
+        }
+
+        string ChangesTooltip() =>
+            changes == null || changes.Count == 0 ? "Scenes and files changed after the last Build Develop"
+                : string.Join("\n", changes.Take(MaxListedChanges)) + (changes.Count > MaxListedChanges ? "\n…" : string.Empty);
+
+        void DrawUpload()
+        {
+            AssistantUI.Header("Build & upload", "Builds with Luna's cloud settings and uploads the playable to the Playground Creative Library.");
+            if (!SafeIsSignedIn())
+            {
+                EditorGUILayout.HelpBox("Sign in to Playground in the Unity Playworks Plugin first.", MessageType.Info);
+                if (GUILayout.Button("Open Unity Playworks Plugin", GUILayout.Width(200)))
+                    EditorApplication.ExecuteMenuItem(PlayworksMenu);
+                return;
+            }
+
+            AssistantUI.SubHeader("Target");
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                using (new EditorGUI.DisabledScope(loadingApps || apps.Length == 0))
+                {
+                    int newApp = EditorGUILayout.Popup("Application", appIndex, apps.Select(a => a.Name).ToArray());
+                    if (newApp != appIndex)
+                    {
+                        appIndex = newApp;
+                        ProjectBuildState.LastApplicationId = apps[appIndex].Id;
+                        RefreshConcepts();
+                    }
+                }
+                if (GUILayout.Button(AssistantUI.Icon("Refresh", "Reload applications from Playground"), GUILayout.Width(28)))
+                    RefreshApps();
+            }
+            if (loadingApps)
+            {
+                EditorGUILayout.LabelField(" ", "Loading applications…");
+                return;
+            }
+            if (apps.Length == 0)
+            {
+                EditorGUILayout.HelpBox("No application loaded from Playground. Press refresh to try again.", MessageType.Warning);
+                return;
+            }
+            DrawConcept();
+
+            EditorGUILayout.Space(12);
+            AssistantUI.SubHeader("Before upload", "Each item only warns: Build & Upload asks for confirmation when one is not OK.");
+            DateTime? last = ProjectBuildState.LastPrivateBuildUtc;
+            bool tested = last.HasValue && changes != null && changes.Count == 0;
+            Check(tested, "Tested in Build Develop",
+                  !last.HasValue ? "Never built" : changes == null ? "…" : changes.Count == 0 ? "Up to date" : changes.Count + " change(s) since",
+                  ChangesTooltip(), Page.Private, 0);
+            Check(checks.StrippedRiskCount == 0, "Stripped code", checks.StrippedSummary, null, Page.Checks, 0);
+            Check(checks.LintIssueCount == 0, "Luna checks", checks.LintSummary, null, Page.Checks, 1);
+
+            EditorGUILayout.Space(14);
+            bool isNew = conceptIndex == 0;
+            using (new EditorGUI.DisabledScope(loadingConcepts || (isNew && ConceptNaming.Sanitize(conceptName).Length == 0)))
+            {
+                if (AssistantUI.PrimaryButton("Build & Upload"))
+                    BuildAndUpload();
+            }
+        }
+
+        // One "Before upload" line: status icon, name, short state, and a link to the page with details.
+        void Check(bool ok, string label, string state, string tooltip, Page target, int checksTab)
+        {
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                GUILayout.Label(AssistantUI.StatusIcon(ok), GUILayout.Width(18), GUILayout.Height(18));
+                GUILayout.Label(new GUIContent(label, tooltip), GUILayout.Width(200));
+                GUILayout.Label(new GUIContent(state, tooltip), AssistantUI.Caption);
+                GUILayout.FlexibleSpace();
+                if (GUILayout.Button("View", EditorStyles.miniButton, GUILayout.Width(48)))
+                {
+                    page = target;
+                    checks.Tab = checksTab;
+                }
+            }
+        }
+
+        void DrawConcept()
+        {
+            if (loadingConcepts)
+            {
+                EditorGUILayout.LabelField("Concept", "Loading concepts…");
+                return;
+            }
+
+            string[] options = new[] { NewConceptLabel }.Concat(concepts.Select(c => c.Name)).ToArray();
+            int newConcept = EditorGUILayout.Popup(new GUIContent("Concept", conceptIndex > 0 ? "Uploads a new version of this concept" : "Creates a new concept"), conceptIndex, options);
+            if (newConcept != conceptIndex)
+            {
+                conceptIndex = newConcept;
+                GUI.FocusControl(null);
+            }
+            if (conceptIndex > 0)
+                return;
+
+            EditorGUI.BeginChangeCheck();
+            suffix = EditorGUILayout.TextField(new GUIContent("Suffix", "Optional, appended as _suffix (e.g. low, oil, Ortho)"), suffix);
+            if (EditorGUI.EndChangeCheck() && !conceptNameEdited)
+                UpdateSuggestedName();
+
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                EditorGUI.BeginChangeCheck();
+                conceptName = EditorGUILayout.TextField(new GUIContent("Name", "playable<number>_<game>_<yymmdd>[_suffix]"), conceptName);
+                if (EditorGUI.EndChangeCheck())
+                    conceptNameEdited = true;
+                if (GUILayout.Button(new GUIContent("↺", "Back to the suggested name"), GUILayout.Width(28)))
+                {
+                    conceptNameEdited = false;
+                    UpdateSuggestedName();
+                    GUI.FocusControl(null);
+                }
+            }
+
+            string clean = ConceptNaming.Sanitize(conceptName);
+            if (clean != conceptName.Trim())
+                Note("Saved as " + clean, false);
+            if (clean.Length > 0 && !ConceptNaming.TryParse(clean, out _))
+                Note("Not playable<number>_<game>_<yymmdd>[_suffix]", true);
+
+            int existing = Array.FindIndex(concepts, c => string.Equals(c.Name, clean, StringComparison.OrdinalIgnoreCase));
+            if (existing >= 0)
+            {
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    Note("This concept already exists", true);
+                    if (GUILayout.Button("Use it", EditorStyles.miniButton, GUILayout.Width(52)))
+                        conceptIndex = existing + 1;
+                }
+            }
+        }
+
+        static void Note(string text, bool warning)
+        {
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                GUILayout.Space(EditorGUIUtility.labelWidth);
+                GUILayout.Label(warning ? AssistantUI.Icon("console.warnicon.sml") : AssistantUI.Icon("console.infoicon.sml"), GUILayout.Width(18), GUILayout.Height(18));
+                GUILayout.Label(text, AssistantUI.Caption);
+                GUILayout.FlexibleSpace();
+            }
+        }
+
+        async void RefreshApps()
+        {
+            if (loadingApps)
+                return;
+            loadingApps = true;
+            try
+            {
+                await LunaPluginBridge.LoadApps();
+                apps = LunaPluginBridge.Apps;
+                // Last app picked here first: luna.json's applicationID is often reset to 0 by the plugin.
+                int last = ProjectBuildState.LastApplicationId;
+                int saved = LunaPluginBridge.SavedApplicationId;
+                appIndex = Array.FindIndex(apps, a => a.Id == last);
+                if (appIndex < 0)
+                    appIndex = Math.Max(0, Array.FindIndex(apps, a => a.Id == saved));
+                concepts = new LunaPluginBridge.Concept[0];
+                if (apps.Length > 0)
+                    RefreshConcepts();
+            }
+            catch (Exception e)
+            {
+                Fail(e);
+            }
+            finally
+            {
+                loadingApps = false;
+                Repaint();
+            }
+        }
+
+        async void RefreshConcepts()
+        {
+            int request = ++conceptsRequest;     // Drop answers for an app the user already switched away from.
+            int appId = apps[appIndex].Id;
+            loadingConcepts = true;
+            try
+            {
+                await LunaPluginBridge.LoadConcepts(appId);
+                if (request != conceptsRequest)
+                    return;
+                concepts = LunaPluginBridge.Concepts.OrderByDescending(c => c.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+                string preferred = ConceptNaming.DefaultConcept(concepts.Select(c => c.Name), branch);
+                conceptIndex = preferred == null ? 0 : Array.FindIndex(concepts, c => c.Name == preferred) + 1;
+                conceptNameEdited = false;
+                UpdateSuggestedName();
+            }
+            catch (Exception e)
+            {
+                Fail(e);
+            }
+            finally
+            {
+                if (request == conceptsRequest)
+                    loadingConcepts = false;
+                Repaint();
+            }
+        }
+
+        void UpdateSuggestedName()
+        {
+            string appName = apps.Length > appIndex ? apps[appIndex].Name : string.Empty;
+            conceptName = ConceptNaming.Suggest(concepts.Select(c => c.Name), appName, branch, DateTime.Now, suffix);
+        }
+
+        async void BuildPrivate(bool openBrowser)
+        {
+            building = true;
+            status = null;
+            try
+            {
+                if (!PrepareScenes())
+                    return;
+                LunaCacheCleaner.ClearBuildCache();
+                if (!await LunaPluginBridge.BuildDevelop())
+                {
+                    status = "Build Develop failed. Check the Unity Playworks Plugin window and the Console.";
+                    return;
+                }
+                ProjectBuildState.MarkPrivateBuilt();
+                status = "Build Develop finished at " + DateTime.Now.ToString("HH:mm") + ".";
+                changesCheckedAt = 0;
+                if (openBrowser || EditorUtility.DisplayDialog("Build Finished", "Would you like to open the playable in the browser?", "Open in browser", "Close"))
+                    LunaPluginBridge.OpenInBrowser();
+                await EstimateSize();
+            }
+            catch (Exception e)
+            {
+                Fail(e);
+            }
+            finally
+            {
+                building = false;
+                Repaint();
+            }
+        }
+
+        void BuildAndUpload()
+        {
+            if (!ConfirmUpload())
+                return;
+
+            LunaPluginBridge.App app = apps[appIndex];
+            bool isNew = conceptIndex == 0;
+            string name = isNew ? ConceptNaming.Sanitize(conceptName) : concepts[conceptIndex - 1].Name;
+            int creativeId = isNew ? -1 : concepts[conceptIndex - 1].Id;
+            try
+            {
+                if (!PrepareScenes())
+                    return;
+                if (!LunaPluginBridge.ClearShaderVariants())
+                    Debug.LogWarning("[LunaBuildAssistant] Assets/SVC_Luna.asset not found; shader variant lists were not cleared.");
+                LunaPluginBridge.SaveUploadTarget(app.Id, name);
+                ProjectBuildState.LastApplicationId = app.Id;
+                LunaPluginBridge.BuildAndUpload(app.Id, creativeId);
+                StrippedCodeCheck.SaveBaseline();       // What this upload strips no longer counts as new.
+                checks.Invalidate();
+                status = $"Build & upload started: {app.Name} / {name}{(isNew ? " (new concept)" : string.Empty)}. " +
+                         "The browser opens the Creative Library upload page when it is done.";
+                Debug.Log("[LunaBuildAssistant] " + status);
+            }
+            catch (Exception e)
+            {
+                Fail(e);
+            }
+        }
+
+        // Uploading work that was never checked in Build Develop, or that the checks flag, needs an explicit yes.
+        bool ConfirmUpload()
+        {
+            DateTime? last = ProjectBuildState.LastPrivateBuildUtc;
+            List<string> changes = ProjectBuildState.ChangesSincePrivateBuild();
+            var parts = new List<string>();
+            if (!last.HasValue)
+                parts.Add("Build Develop has not been run in this project yet.");
+            else if (changes.Count > 0)
+                parts.Add($"{changes.Count} change(s) since the last Build Develop ({last.Value.ToLocalTime():yyyy-MM-dd HH:mm}):\n- " +
+                          string.Join("\n- ", changes.Take(MaxListedChanges)) + (changes.Count > MaxListedChanges ? "\n…" : string.Empty));
+            parts.AddRange(checks.Warnings());
+            if (parts.Count == 0)
+                return true;
+            return EditorUtility.DisplayDialog("Before uploading", string.Join("\n\n", parts) + "\n\nBuild & upload anyway?", "Build & Upload", "Cancel");
+        }
+
+        // Regenerates the _NoPrefab copies (or points Luna back at the source scenes); false when cancelled.
+        bool PrepareScenes()
+        {
+            try
+            {
+                if (NoPrefabScenes.Prepare(out string summary))
+                {
+                    if (!string.IsNullOrEmpty(summary))
+                        Debug.Log("[LunaBuildAssistant] " + summary);
+                    return true;
+                }
+                status = "Build cancelled: save the modified scene first.";
+            }
+            catch (InvalidOperationException e)
+            {
+                status = "Build cancelled: " + e.Message;     // e.g. the _NoPrefab scene is open.
+            }
+            return false;
+        }
+
+        // The plugin's Size breakdown for the chosen network, right after Build Develop.
+        async System.Threading.Tasks.Task EstimateSize()
+        {
+            if (!LunaPluginBridge.CanEstimateSize)
+                return;
+            await sizeView.Estimate();
+            BuildSizeReport.Snapshot now = BuildSizeReport.Latest, before = BuildSizeReport.Previous;
+            if (now != null)
+                status += $" {NetworkName(now.network)}: {BuildSizeReport.FormatBytes(now.totalBytes)}" +
+                          (before == null ? "." : " (" + BuildSizeReport.FormatDelta(now.totalBytes - before.totalBytes) + ").");
+        }
+
+        static string NetworkName(string network) =>
+            LunaPluginBridge.SizeNetworks.FirstOrDefault(n => n.Key == network).Value ?? network;
+
+        bool SafeIsSignedIn() => Safe(() => LunaPluginBridge.IsSignedIn);
+        bool SafeIsBuilding() => LunaPluginBridge.IsAvailable && Safe(() => LunaPluginBridge.IsBuilding);
+
+        T Safe<T>(Func<T> read)
+        {
+            try { return read(); }
+            catch (Exception e) { Fail(e); return default; }
+        }
+
+        void Fail(Exception e)
+        {
+            LunaPluginBridge.Block(e);
+            Debug.LogException(e);
+            status = null;
+            Repaint();
+        }
+    }
+}
