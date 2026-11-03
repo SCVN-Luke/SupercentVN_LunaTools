@@ -178,11 +178,11 @@ namespace Supercent.Util.Editor
                 }
                 GUILayout.Space(22);
 
+                Nav(Page.Assets, "Assets", 0);
                 Nav(Page.Private, "Build Develop", 0);
                 Nav(Page.Upload, "Build & upload", 0);
                 Nav(Page.Checks, "Checks", checks.IssueCount);
                 Nav(Page.Size, "Build size", 0);
-                Nav(Page.Assets, "Assets", 0);
                 GUILayout.FlexibleSpace();
 
                 using (new EditorGUILayout.HorizontalScope())

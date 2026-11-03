@@ -94,7 +94,7 @@ namespace Supercent.Util.Editor
             LunaPluginBridge.SaveConfig();
         }
 
-        // One line for a rule list: "256×256 · PNG32 · PNGQuant", "96 kb/s · Mono"...
+        // One line for a rule list: "256×256 · PNG32 · PNGQuant", "96 kbps · Mono"...
         public static string Summary(Kind kind, object values)
         {
             switch (kind)
@@ -108,7 +108,7 @@ namespace Supercent.Util.Editor
                 case Kind.Sound:
                     string[] channels = Options(values.GetType(), "soundChannels");
                     int channel = (int)GetPath(values, "channels");
-                    return SoundBitrate(values) + " kb/s" + (channel >= 0 && channel < channels.Length ? " · " + channels[channel] : string.Empty);
+                    return SoundBitrate(values) + " kbps" + (channel >= 0 && channel < channels.Length ? " · " + channels[channel] : string.Empty);
                 case Kind.Font:
                     return $"glyph {GetPath(values, "data.size")} · {GetPath(values, "data.textureWidth")}×{GetPath(values, "data.textureHeight")}";
                 case Kind.Mesh:
@@ -237,7 +237,8 @@ namespace Supercent.Util.Editor
             Edit(rule, "bitrate", (int v) =>
             {
                 int[] values = Bitrates.Contains(v) ? Bitrates : Bitrates.Append(v).OrderBy(b => b).ToArray();
-                return EditorGUILayout.IntPopup("Bitrate", v, values.Select(b => b + " kb/s").ToArray(), values);
+                // No "/" in popup entries: Unity turns it into a submenu.
+                return EditorGUILayout.IntPopup("Bitrate", v, values.Select(b => b + " kbps").ToArray(), values);
             });
             GUILayout.Label("Luna always encodes sounds as MP3.", AssistantUI.Caption);
         }
