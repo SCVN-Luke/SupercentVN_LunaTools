@@ -309,6 +309,9 @@ namespace Supercent.Util.Editor
         // Starts the plugin's local develop server if needed and opens it, like "Open in browser".
         public static void OpenInBrowser() => Call(Shapes.OpenInBrowser, null, false);
 
+        // Same, without opening a browser (the plugin opens one only when the argument is false).
+        public static void StartDevelopServer() => Call(Shapes.OpenInBrowser, null, true);
+
         // Same call as the plugin's "Build & upload"; creativeId -1 creates a concept named after luna.json creativeName.
         public static void BuildAndUpload(int appId, int creativeId) => Call(Shapes.BuildAndUpload, Shapes.Controller.GetValue(null), appId, creativeId);
 

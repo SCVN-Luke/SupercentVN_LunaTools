@@ -24,6 +24,21 @@ Commit the submodule, `.gitmodules` and `Assets/LunaTools.meta`.
 
 Cloning a project: `git clone --recurse-submodules …`, or `git submodule update --init` afterwards.
 
+## Dev Tools (Build Develop debug panel)
+
+Build Develop → "Open with Dev Tools" (on by default) opens the playable through a local proxy
+(`DevToolsProxy`, port 8100+) that adds `Editor/LunaBuildAssistant/DevTools/LunaDevTools.js` to the
+page while it loads. Press `` ` `` or the "Dev Tools" pill: frame time (p95/worst), engine and WebGL
+draw calls, shader switches, GPU uploads and memory estimate, JS heap and allocation rate; a draw-call
+slider and frame capture (Unity Frame Debugger style) plus Spector.js; most-called methods; pause,
+step, speed ×0.25–×8, restart, activate a GameObject by name (end card). The phone URL is shown in
+the Assistant.
+
+It cannot change a build: nothing is written to the build output (the size estimate reads the same
+files), the script sits in an Editor folder Luna never exports, call counts come from the `TRACE`
+calls Luna already makes (forwarded unchanged, so runtime analysis and code stripping see the same
+calls), and the engine's time scale / pause are only touched after a button press.
+
 ## Changing the tool
 
 Edit it inside any project (`Assets/LunaTools`), then commit and push **in the

@@ -339,10 +339,59 @@ namespace Supercent.Util.Editor
             if (noPrefab && scenePicker.Selected != null)
                 foreach (string scene in scenePicker.Selected)
                     GUILayout.Label("     → " + System.IO.Path.GetFileName(NoPrefabScenes.CopyPath(scene)), AssistantUI.Caption);
+            bool devTools = EditorGUILayout.ToggleLeft(new GUIContent("Open with Dev Tools",
+                "Adds a debug panel to the Build Develop page (` key): frame time, draw calls step by step, frame capture, " +
+                "most called methods, JS heap, pause / step / speed, restart.\n\n" +
+                "A local proxy adds it while the page loads: nothing is written to the build, so the uploaded playable, " +
+                "luna.json and the size estimate are unchanged."), LunaDevTools.Enabled);
+            if (devTools != LunaDevTools.Enabled)
+                LunaDevTools.Enabled = devTools;
+            DrawDevTools();
 
             EditorGUILayout.Space(14);
             if (AssistantUI.PrimaryButton("Clear Cache & Build Develop"))
                 BuildPrivate(openBrowser);
+        }
+
+        // The last Build Develop in the browser: through the Dev Tools proxy, or the plugin's plain page.
+        static void OpenPlayable()
+        {
+            if (LunaDevTools.Enabled)
+                LunaDevTools.Open();
+            else
+                LunaPluginBridge.OpenInBrowser();
+        }
+
+        // Dev Tools state under the options: addresses while the proxy runs, or a way to open the last build.
+        static void DrawDevTools()
+        {
+            if (!LunaDevTools.Enabled && !LunaDevTools.IsRunning)
+                return;
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                GUILayout.Space(18);
+                if (LunaDevTools.IsRunning)
+                {
+                    string lan = LunaDevTools.LanUrl;
+                    GUILayout.Label(new GUIContent("Dev Tools: " + LunaDevTools.LocalUrl + (lan != null ? "   phone: " + lan : string.Empty),
+                        "Phones on the same network open the LAN address (allow Unity through the firewall if asked)."), AssistantUI.Caption);
+                    if (EditorGUILayout.LinkButton("Open"))
+                        LunaDevTools.Open();
+                    if (lan != null && EditorGUILayout.LinkButton("Copy phone URL"))
+                        EditorGUIUtility.systemCopyBuffer = lan;
+                    if (EditorGUILayout.LinkButton("Stop"))
+                        LunaDevTools.Stop();
+                }
+                else
+                {
+                    using (new EditorGUI.DisabledScope(!ProjectBuildState.LastPrivateBuildUtc.HasValue))
+                        if (EditorGUILayout.LinkButton("Open the last build with Dev Tools"))
+                            LunaDevTools.Open();
+                    if (LunaDevTools.LastError != null)
+                        GUILayout.Label(new GUIContent(LunaDevTools.LastError, LunaDevTools.LastError), AssistantUI.Caption);
+                }
+                GUILayout.FlexibleSpace();
+            }
         }
 
         string ChangesTooltip() =>
@@ -582,7 +631,7 @@ namespace Supercent.Util.Editor
                 status = "Build Develop finished at " + DateTime.Now.ToString("HH:mm") + ".";
                 changesCheckedAt = 0;
                 if (openBrowser || EditorUtility.DisplayDialog("Build Finished", "Would you like to open the playable in the browser?", "Open in browser", "Close"))
-                    LunaPluginBridge.OpenInBrowser();
+                    OpenPlayable();
                 await EstimateSize();
             }
             catch (Exception e)
