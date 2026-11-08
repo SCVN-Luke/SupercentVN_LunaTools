@@ -15,6 +15,7 @@ namespace Supercent.Util.Editor
         public const string AssemblyName = "EditorScripts";
         public const string MediatorTypeName = "Luna.Unity.Tutorial.TutorialMediator";
         public const string SvcTypeName = "Luna.Unity.Utils.Shaders.LunaSVC";
+        public const string DiagnosticsReportTypeName = "Luna.Unity.EditorScripts.ProjectDiagnostics.DiagnosticsReport";
 
         const BindingFlags StaticMembers = BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly;
         const BindingFlags InstanceMembers = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly;
@@ -48,6 +49,7 @@ namespace Supercent.Util.Editor
 
             // Optional: a missing member disables only its feature, never the whole tool.
             public MethodInfo EstimateSize;             // controller Task<string>(string network): Size breakdown statistics
+            public FieldInfo DiagnosticsReport;         // static DiagnosticsReport: Project Diagnostics of the last build
 
             public readonly List<string> Errors = new List<string>();
         }
@@ -165,6 +167,11 @@ namespace Supercent.Util.Editor
                 r.CurrentCommand = Single(r, "current command field", controller.GetFields(InstanceMembers).Where(f => f.FieldType == command));
                 r.CurrentStage = Single(r, "current stage field", controller.GetFields(InstanceMembers).Where(f => f.FieldType == stage));
             }
+
+            // Project Diagnostics: the only static field holding the (unobfuscated) DiagnosticsReport type.
+            FieldInfo[] reports = types.SelectMany(t => t.GetFields(StaticMembers))
+                .Where(f => Is(f.FieldType, DiagnosticsReportTypeName)).Take(2).ToArray();
+            r.DiagnosticsReport = reports.Length == 1 ? reports[0] : null;
 
             // Local develop server: static class queueing Tuple<object, ...> server events,
             // with a static void(bool) "start and open" entry.

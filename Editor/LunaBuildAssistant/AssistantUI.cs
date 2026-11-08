@@ -37,6 +37,16 @@ namespace Supercent.Util.Editor
         public static GUIStyle Caption => caption ??= new GUIStyle(EditorStyles.miniLabel) { normal = { textColor = Pro ? new Color(0.62f, 0.62f, 0.62f) : new Color(0.35f, 0.35f, 0.35f) } };
         public static GUIStyle TileValue => tileValue ??= new GUIStyle(EditorStyles.boldLabel) { fontSize = 15 };
         public static GUIStyle RowLabel => rowLabel ??= new GUIStyle(EditorStyles.label) { clipping = TextClipping.Clip };
+        public static GUIStyle WrappedLabel => wrappedLabel ??= new GUIStyle(EditorStyles.label) { wordWrap = true, richText = false };
+        public static GUIStyle WrappedCaption => wrappedCaption ??= new GUIStyle(Caption) { wordWrap = true };
+        public static GUIStyle CaptionFoldout => captionFoldout ??= new GUIStyle(EditorStyles.foldout)
+        {
+            fontSize = EditorStyles.miniLabel.fontSize,
+            normal = { textColor = Caption.normal.textColor },
+            onNormal = { textColor = Caption.normal.textColor },
+        };
+
+        static GUIStyle wrappedLabel, wrappedCaption, captionFoldout;
 
         public static Color KindColor(int index) => Palette[Mathf.Clamp(index, 0, Palette.Length - 1)];
 

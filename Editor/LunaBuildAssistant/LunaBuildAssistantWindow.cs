@@ -22,6 +22,7 @@ namespace Supercent.Util.Editor
         const float SidebarWidth = 190f;
         const float ContentMargin = 12f;                    // Space on each side of the page content.
         const double ChangesInterval = 3.0;                 // Seconds between scans for files changed since the last Build Develop.
+        const double UploadStartTimeout = 10.0;             // Build & upload that never shows as building: read its result anyway.
 
         enum Page { Private, Upload, Checks, Size, Assets }
 
@@ -41,9 +42,14 @@ namespace Supercent.Util.Editor
         readonly BuildSizeView sizeView = new BuildSizeView();
         readonly AssetSettingsView assetsView = new AssetSettingsView();
         readonly ScenePickerPanel scenePicker = new ScenePickerPanel();
+        readonly BuildReportPanel reportPanel = new BuildReportPanel();
         [SerializeField] Page page;
+        [SerializeField] BuildReport report;            // Errors/warnings of the last build, kept across domain reloads.
         List<string> changes;
         double changesCheckedAt;
+        string uploadReportBefore;                      // Diagnostics report id when Build & upload started.
+        double uploadStartedAt = -1;                    // -1: no Build & upload to wait for.
+        bool uploadSawBuilding;
 
         [MenuItem("Tools/Luna/Build Assistant")]
         static void Open() => Open(null);
@@ -70,6 +76,7 @@ namespace Supercent.Util.Editor
             sizeView.Repaint = Repaint;
             scenePicker.OnError = Fail;
             scenePicker.Repaint = Repaint;
+            reportPanel.OpenPlayworks = OpenPlayworks;
             checks.Invalidate();
         }
 
@@ -89,6 +96,13 @@ namespace Supercent.Util.Editor
                 RefreshApps();
             }
             bool busy = building || SafeIsBuilding();
+            if (uploadStartedAt >= 0)
+                WatchUpload(busy);
+            if (report != null && report.NeedsSignIn && LunaPluginBridge.IsAvailable && SafeIsSignedIn())
+            {
+                report = null;              // Signed in meanwhile: the sign-in error no longer applies.
+                Repaint();
+            }
             if (sizeView.Update())
                 Repaint();
             if (!busy && LunaPluginBridge.IsAvailable && checks.Refresh())
@@ -148,11 +162,7 @@ namespace Supercent.Util.Editor
                                 break;
                         }
                     }
-                    if (!string.IsNullOrEmpty(status))
-                    {
-                        AssistantUI.Separator();
-                        GUILayout.Label(new GUIContent(status, status), AssistantUI.Caption);
-                    }
+                    DrawStatus();
                     GUILayout.Space(6);
                 }
                 GUILayout.Space(ContentMargin);
@@ -211,13 +221,50 @@ namespace Supercent.Util.Editor
 
         void Nav(Page target, string text, int badge)
         {
-            if (AssistantUI.NavButton(text, page == target, badge) && (page != Page.Assets || target == Page.Assets || assetsView.ConfirmLeave()))
+            if (AssistantUI.NavButton(text, page == target, badge))
+                GoTo(target);
+        }
+
+        void GoTo(Page target)
+        {
+            if (page == Page.Assets && target != Page.Assets && !assetsView.ConfirmLeave())
+                return;
+            if (target == Page.Assets)
+                assetsView.Reload();
+            page = target;
+            GUI.FocusControl(null);
+        }
+
+        // Bottom line: a failed build's summary (with a way to its details) or the last status message.
+        void DrawStatus()
+        {
+            if (report != null && report.Failed)
             {
-                if (target == Page.Assets)
-                    assetsView.Reload();
-                page = target;
-                GUI.FocusControl(null);
+                AssistantUI.Separator();
+                Page reportPage = report.Upload ? Page.Upload : Page.Private;
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    GUILayout.Label(AssistantUI.Icon("console.erroricon.sml"), GUILayout.Width(18), GUILayout.Height(18));
+                    GUILayout.Label(report.Summary, EditorStyles.miniBoldLabel);
+                    if (page != reportPage && EditorGUILayout.LinkButton("View errors"))
+                        GoTo(reportPage);
+                    GUILayout.FlexibleSpace();
+                }
             }
+            else if (!string.IsNullOrEmpty(status))
+            {
+                AssistantUI.Separator();
+                GUILayout.Label(new GUIContent(status, status), AssistantUI.Caption);
+            }
+        }
+
+        // The last build's errors and warnings, on the page of the build that produced them.
+        void DrawReport(bool upload)
+        {
+            if (report == null || report.Upload != upload)
+                return;
+            if (!reportPanel.Draw(report))
+                report = null;
         }
 
         // Blocking errors replace the page; false when the tool cannot be used.
@@ -262,6 +309,7 @@ namespace Supercent.Util.Editor
             AssistantUI.Header("Build Develop",
                 "Clear Build Cache → Build Develop → open the local server → size breakdown.\n\n" +
                 "Play every path here: Luna strips code that never runs in Build Develop from the cloud build.");
+            DrawReport(false);
 
             using (new EditorGUILayout.HorizontalScope())
             {
@@ -304,6 +352,7 @@ namespace Supercent.Util.Editor
         void DrawUpload()
         {
             AssistantUI.Header("Build & upload", "Builds with Luna's cloud settings and uploads the playable to the Playground Creative Library.");
+            DrawReport(true);
             if (!SafeIsSignedIn())
             {
                 EditorGUILayout.HelpBox("Sign in to Playground in the Unity Playworks Plugin first.", MessageType.Info);
@@ -508,18 +557,27 @@ namespace Supercent.Util.Editor
 
         async void BuildPrivate(bool openBrowser)
         {
+            const string action = "Build Develop";
             building = true;
             status = null;
+            report = null;
             try
             {
+                // The plugin only builds signed in; say so here instead of in its window.
+                if (!SafeIsSignedIn())
+                {
+                    if (LunaPluginBridge.IsAvailable)
+                        report = BuildDiagnostics.NotSignedIn(action, false);
+                    return;
+                }
                 if (!PrepareScenes())
                     return;
                 LunaCacheCleaner.ClearBuildCache();
-                if (!await LunaPluginBridge.BuildDevelop())
-                {
-                    status = "Build Develop failed. Check the Unity Playworks Plugin window and the Console.";
+                string reportBefore = BuildDiagnostics.CurrentReportId();
+                bool built = await LunaPluginBridge.BuildDevelop();
+                report = BuildDiagnostics.Collect(action, false, !built, reportBefore);
+                if (!built)
                     return;
-                }
                 ProjectBuildState.MarkPrivateBuilt();
                 status = "Build Develop finished at " + DateTime.Now.ToString("HH:mm") + ".";
                 changesCheckedAt = 0;
@@ -555,6 +613,10 @@ namespace Supercent.Util.Editor
                     Debug.LogWarning("[LunaBuildAssistant] Assets/SVC_Luna.asset not found; shader variant lists were not cleared.");
                 LunaPluginBridge.SaveUploadTarget(app.Id, name);
                 ProjectBuildState.LastApplicationId = app.Id;
+                report = null;
+                uploadReportBefore = BuildDiagnostics.CurrentReportId();
+                uploadStartedAt = EditorApplication.timeSinceStartup;
+                uploadSawBuilding = false;
                 LunaPluginBridge.BuildAndUpload(app.Id, creativeId);
                 StrippedCodeCheck.SaveBaseline();       // What this upload strips no longer counts as new.
                 checks.Invalidate();
@@ -564,8 +626,26 @@ namespace Supercent.Util.Editor
             }
             catch (Exception e)
             {
+                uploadStartedAt = -1;
                 Fail(e);
             }
+        }
+
+        // Build & upload runs in the plugin without a result: once it stops building, read what it reported.
+        void WatchUpload(bool busy)
+        {
+            if (busy)
+            {
+                uploadSawBuilding = true;
+                return;
+            }
+            if (!uploadSawBuilding && EditorApplication.timeSinceStartup - uploadStartedAt < UploadStartTimeout)
+                return;
+            uploadStartedAt = -1;
+            report = BuildDiagnostics.Collect("Build & upload", true, false, uploadReportBefore);
+            if (report.Failed)
+                status = null;
+            Repaint();
         }
 
         // Uploading work that was never checked in Build Develop, or that the checks flag, needs an explicit yes.

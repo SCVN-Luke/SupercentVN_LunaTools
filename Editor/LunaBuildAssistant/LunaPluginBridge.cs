@@ -258,6 +258,54 @@ namespace Supercent.Util.Editor
             public void Dispose() => EditorApplication.UnlockReloadAssemblies();
         }
 
+        // One Project Diagnostics entry. Description/Details are usually keys of the plugin's localization table,
+        // filled with DescriptionValues/DetailsValues (see BuildDiagnostics).
+        public struct Diagnostic
+        {
+            public bool IsError;
+            public int Stage;
+            public string Code, Description, FilePath, ClassName, MemberName;
+            public string[] Details, DescriptionValues, DetailsValues;
+            public int Line;
+        }
+
+        const byte ErrorSeverity = 1;    // The plugin turns its Project Diagnostics badge red on Severity == 1.
+
+        // The Project Diagnostics report of the plugin's last build. id changes with every new report, so a
+        // report left over from an earlier build can be told apart. False when the plugin keeps none yet.
+        public static bool TryGetDiagnostics(out string id, out Diagnostic[] entries)
+        {
+            id = null;
+            entries = new Diagnostic[0];
+            object report = Shapes.DiagnosticsReport?.GetValue(null);
+            if (report == null)
+                return false;
+
+            var logs = (Array)Loose(report, "Logs");
+            id = Loose(report, "BuildID") + "|" + Loose(report, "StartTime") + "|" + (logs?.Length ?? 0);
+            if (logs == null)
+                return true;
+            entries = logs.Cast<object>().Where(e => e != null).Select(e => new Diagnostic
+            {
+                IsError = Convert.ToByte(Loose(e, "Severity") ?? (byte)0) == ErrorSeverity,
+                Stage = Convert.ToInt32(Loose(e, "Stage") ?? 0),
+                Code = Loose(e, "ErrorCode") as string,
+                Description = Loose(e, "Description") as string,
+                Details = Loose(e, "Details") as string[],
+                DescriptionValues = Loose(e, "DescriptionValues") as string[],
+                DetailsValues = Loose(e, "DetailsValues") as string[],
+                FilePath = Loose(e, "FilePath") as string,
+                Line = Convert.ToInt32(Loose(e, "LinePosition") ?? 0),
+                ClassName = Loose(e, "ClassName") as string,
+                MemberName = Loose(e, "MemberName") as string,
+            }).ToArray();
+            return true;
+        }
+
+        // Report fields are plain data: a missing one reads as null instead of blocking the tool.
+        static object Loose(object target, string name) =>
+            target.GetType().GetField(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(target);
+
         // Starts the plugin's local develop server if needed and opens it, like "Open in browser".
         public static void OpenInBrowser() => Call(Shapes.OpenInBrowser, null, false);
 
