@@ -49,28 +49,14 @@ namespace Supercent.Util.Editor
         static void SaveCompileResult()
         {
             var errors = compileMessages.Where(m => m.type == CompilerMessageType.Error).ToList();
-            StoreJson(CompileResultKey, new Dictionary<string, object>
+            SessionState.SetString(CompileResultKey, MiniJson.Write(new Dictionary<string, object>
             {
                 { "finishedAt", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") },
                 { "seconds", compileStartedUtc == default ? null : (object)Math.Round((DateTime.UtcNow - compileStartedUtc).TotalSeconds, 1) },
                 { "errorCount", errors.Count },
                 { "errors", errors.Take(40).Select(CompileIssue).ToList() },
                 { "warningCount", compileMessages.Count(m => m.type == CompilerMessageType.Warning) },
-            });
-        }
-
-        // SessionState does not keep non-ASCII text intact ("−" came back as "âˆ’"): store JSON with \u escapes. Non-ASCII
-        // characters only occur inside JSON strings, where the escape means the same.
-        static void StoreJson(string key, Dictionary<string, object> value)
-        {
-            string json = MiniJson.Write(value);
-            var sb = new System.Text.StringBuilder(json.Length);
-            foreach (char c in json)
-                if (c > 127)
-                    sb.Append("\\u").Append(((int)c).ToString("x4"));
-                else
-                    sb.Append(c);
-            SessionState.SetString(key, sb.ToString());
+            }));
         }
 
         static object CompileIssue(CompilerMessage m) => new Dictionary<string, object>
@@ -87,7 +73,7 @@ namespace Supercent.Util.Editor
                 var summary = BuildSummary(LunaBuildAssistantWindow.AgentBuildReport, LunaBuildAssistantWindow.AgentBuildStatus);
                 summary["seconds"] = Math.Round(LunaBuildAssistantWindow.AgentBuildSeconds, 1);
                 summary["finishedAt"] = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-                StoreJson(BuildResultKey, summary);
+                SessionState.SetString(BuildResultKey, MiniJson.Write(summary));
                 SessionState.EraseString(BuildStartedKey);
             }
             buildWasRunning = running;
