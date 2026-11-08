@@ -76,6 +76,7 @@ namespace Supercent.Util.Editor
             try
             {
                 proxy = DevToolsProxy.Start(FirstPort, PortCount, UpstreamPort, script);
+                AttachAgents();
                 return true;
             }
             catch (Exception e)
@@ -83,6 +84,15 @@ namespace Supercent.Util.Editor
                 LastError = e.Message;
                 return false;
             }
+        }
+
+        // The agents' channel (pages poll it for commands) is always served; the MCP endpoint only when enabled.
+        public static void AttachAgents()
+        {
+            if (proxy == null)
+                return;
+            proxy.Channel = LunaMcp.Channel;
+            proxy.Mcp = LunaMcp.Enabled ? LunaMcp.Server : null;
         }
 
         public static void Stop()

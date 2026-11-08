@@ -37,6 +37,14 @@ namespace Supercent.Util.Editor
         public int UpstreamPort { get => upstreamPort; set => upstreamPort = value; }
         public string LastError { get; private set; }
 
+        // Agents: MCP endpoint (this machine only) and the channel the Dev Tools pages poll for commands.
+        public const string McpRoute = "/mcp";
+        public const string ChannelRoute = "/__luna_devtools/channel";
+        public const string ResultRoute = "/__luna_devtools/result";
+        const int MaxBodyBytes = 16 * 1024 * 1024;
+        public McpServer Mcp { get; set; }
+        public DevToolsChannel Channel { get; set; }
+
         DevToolsProxy(TcpListener listener, int port, int upstreamPort, string scriptFile)
         {
             this.listener = listener;
@@ -159,6 +167,10 @@ namespace Supercent.Util.Editor
 
                     if (method == "GET" && path == ScriptRoute)
                         ServeScript(browser);
+                    else if (path == McpRoute)
+                        ServeMcp(client, browser, method, head, rest);
+                    else if (path == ChannelRoute || path == ResultRoute)
+                        ServeChannel(browser, method, path, requestLine[1], head, rest);
                     else if (method == "GET" && path.EndsWith("/iframe.html", StringComparison.OrdinalIgnoreCase))
                         ServeInjected(browser, head, "agent");
                     else if (method == "GET" && (path == "/" || path.Equals("/index.html", StringComparison.OrdinalIgnoreCase)))
@@ -305,10 +317,120 @@ namespace Supercent.Util.Editor
             Respond(browser, "200 OK", "application/javascript; charset=utf-8", body);
         }
 
-        static void Respond(Stream browser, string status, string contentType, byte[] body)
+        // MCP over Streamable HTTP: POST a JSON-RPC message, get JSON back (202 for notifications). Only this machine may
+        // call it, and only without a foreign Origin (a web page cannot drive it through the browser).
+        void ServeMcp(TcpClient client, Stream browser, string method, string head, byte[] rest)
+        {
+            McpServer mcp = Mcp;
+            if (mcp == null)
+            {
+                Respond(browser, "404 Not Found", "text/plain; charset=utf-8", Encoding.UTF8.GetBytes("MCP server is off (Luna Build Assistant)."));
+                return;
+            }
+            if (!IsLoopback(client) || !LocalOrigin(Header(head, "Origin")))
+            {
+                Respond(browser, "403 Forbidden", "text/plain; charset=utf-8", Encoding.UTF8.GetBytes("MCP is only served to this machine."));
+                return;
+            }
+            if (method != "POST")
+            {
+                Respond(browser, "405 Method Not Allowed", "text/plain; charset=utf-8", Encoding.UTF8.GetBytes("POST JSON-RPC messages here."), "Allow: POST\r\n");
+                return;
+            }
+            string body = ReadBody(browser, head, rest);
+            string response = mcp.Handle(body);
+            if (response == null)
+                Respond(browser, "202 Accepted", "application/json", new byte[0]);
+            else
+                Respond(browser, "200 OK", "application/json; charset=utf-8", Encoding.UTF8.GetBytes(response));
+        }
+
+        void ServeChannel(Stream browser, string method, string path, string target, string head, byte[] rest)
+        {
+            DevToolsChannel channel = Channel;
+            if (channel == null || method != "POST")
+            {
+                Respond(browser, "404 Not Found", "application/json", Encoding.UTF8.GetBytes("{\"error\":\"no channel\"}"));
+                return;
+            }
+            string body = ReadBody(browser, head, rest);
+            string session = Query(target, "session");
+            string reply = path == ChannelRoute ? channel.Poll(session, body) : channel.Results(session, body);
+            Respond(browser, "200 OK", "application/json; charset=utf-8", Encoding.UTF8.GetBytes(reply));
+        }
+
+        static string ReadBody(Stream stream, string head, byte[] rest)
+        {
+            int length = int.TryParse(Header(head, "Content-Length"), out int n) ? n : rest.Length;
+            if (length < 0 || length > MaxBodyBytes)
+                throw new IOException("Request body too large");
+            var body = new byte[length];
+            int have = Math.Min(rest.Length, length);
+            Buffer.BlockCopy(rest, 0, body, 0, have);
+            while (have < length)
+            {
+                int read = stream.Read(body, have, length - have);
+                if (read <= 0)
+                    break;
+                have += read;
+            }
+            return Encoding.UTF8.GetString(body, 0, have);
+        }
+
+        static string Header(string head, string name)
+        {
+            foreach (string line in head.Split(new[] { "\r\n" }, StringSplitOptions.None))
+            {
+                int colon = line.IndexOf(':');
+                if (colon > 0 && Is(line.Substring(0, colon).Trim(), name))
+                    return line.Substring(colon + 1).Trim();
+            }
+            return null;
+        }
+
+        static string Query(string target, string name)
+        {
+            int q = target.IndexOf('?');
+            if (q < 0)
+                return null;
+            foreach (string pair in target.Substring(q + 1).Split('&'))
+            {
+                int eq = pair.IndexOf('=');
+                if (eq > 0 && pair.Substring(0, eq) == name)
+                    return Uri.UnescapeDataString(pair.Substring(eq + 1));
+            }
+            return null;
+        }
+
+        static bool IsLoopback(TcpClient client)
+        {
+            try
+            {
+                var endPoint = client.Client.RemoteEndPoint as IPEndPoint;
+                if (endPoint == null)
+                    return false;
+                IPAddress address = endPoint.Address.IsIPv4MappedToIPv6 ? endPoint.Address.MapToIPv4() : endPoint.Address;
+                return IPAddress.IsLoopback(address);
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        // No Origin (CLI agents) or a localhost page.
+        static bool LocalOrigin(string origin)
+        {
+            if (string.IsNullOrEmpty(origin) || origin == "null")
+                return string.IsNullOrEmpty(origin);
+            return Uri.TryCreate(origin, UriKind.Absolute, out Uri uri)
+                   && (uri.Host == "localhost" || uri.Host == "127.0.0.1" || uri.Host == "[::1]" || uri.Host == "::1");
+        }
+
+        static void Respond(Stream browser, string status, string contentType, byte[] body, string extraHeaders = "")
         {
             string head = $"HTTP/1.1 {status}\r\nContent-Type: {contentType}\r\nContent-Length: {body.Length}\r\n" +
-                          "Cache-Control: no-store\r\nConnection: close\r\n\r\n";
+                          extraHeaders + "Cache-Control: no-store\r\nConnection: close\r\n\r\n";
             byte[] headBytes = Latin1.GetBytes(head);
             browser.Write(headBytes, 0, headBytes.Length);
             browser.Write(body, 0, body.Length);

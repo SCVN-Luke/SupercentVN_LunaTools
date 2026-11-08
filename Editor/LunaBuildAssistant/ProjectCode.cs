@@ -110,10 +110,19 @@ namespace Supercent.Util.Editor
         // Opens the source file declaring the type, at the member when it can be found.
         public static bool OpenSource(Type type, string member)
         {
-            string file = SourceFile(type, out string text);
+            if (!TryLocate(type, member, out string file, out int line))
+                return false;
+            UnityEngine.Object asset = AssetDatabase.LoadMainAssetAtPath(file);
+            return asset != null && AssetDatabase.OpenAsset(asset, line);
+        }
+
+        // Source file ("Assets/...") and 1-based line of the type, or of the member when it can be found.
+        public static bool TryLocate(Type type, string member, out string file, out int line)
+        {
+            line = 1;
+            file = SourceFile(type, out string text);
             if (file == null)
                 return false;
-            int line = 1;
             string name = member == null ? null : member.Split('#')[0];
             if (name == "ctor")
                 name = ShortName(type);
@@ -126,8 +135,7 @@ namespace Supercent.Util.Editor
                     start = m.Index;
             }
             line += text.Take(start).Count(c => c == '\n');
-            UnityEngine.Object asset = AssetDatabase.LoadMainAssetAtPath(file);
-            return asset != null && AssetDatabase.OpenAsset(asset, line);
+            return true;
         }
 
         public static string SourceFile(Type type, out string text)

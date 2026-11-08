@@ -101,11 +101,20 @@
         // ---------- Hot paths: count TRACE("Class#method", this) calls ----------
         // Luna's develop compiler starts every method with `if (TRACE) { TRACE("Class#method", this); }`.
         // The accessor keeps `TRACE` exactly what Luna's runtime analysis sets; it only counts before forwarding.
-        var hot = { recording: false, current: new Map(), total: new Map(), peak: new Map(), frames: 0, installed: false };
+        var hot = { recording: false, current: new Map(), total: new Map(), peak: new Map(), frames: 0, installed: false, seq: 0 };
+        // The last few traced names (always, it is one array write): names the coroutine a script just started.
+        var recent = new Array(16), recentAt = 0;
         try {
             var traceTarget = win.TRACE;
             var traceProxy = function (name, self) {
-                if (hot.recording && typeof name === 'string') hot.current.set(name, (hot.current.get(name) || 0) + 1);
+                if (typeof name === 'string') {
+                    recent[recentAt = (recentAt + 1) & 15] = name;
+                    if (hot.recording) {
+                        hot.current.set(name, (hot.current.get(name) || 0) + 1);
+                        hot.seq++;
+                        if (scripts.stack.length) scopeTrace(name);
+                    }
+                }
                 return traceTarget(name, self);
             };
             Object.defineProperty(win, 'TRACE', {
@@ -120,28 +129,348 @@
         }
 
         function hotEndFrame() {
-            if (!hot.recording || hot.current.size === 0) return;
+            if (!hot.recording) return;
+            if (hot.current.size === 0 && !scripts.frameDirty) return;
             hot.frames++;
             hot.current.forEach(function (count, name) {
                 hot.total.set(name, (hot.total.get(name) || 0) + count);
                 if (count > (hot.peak.get(name) || 0)) hot.peak.set(name, count);
             });
             hot.current.clear();
+            scriptsEndFrame();
         }
+
+        // Luna's own runtime (compiled C# of UnityEngine, System, ...) next to the project's code.
+        var ENGINE_NAME = /^(UnityEngine|UnityEditor|System|Bridge|TMPro|DG\.Tweening|Newtonsoft|Luna\.|LunaUnity|Unity\.|Spine|Cinemachine|Microsoft)\b/;
+        function isProject(name) { return !ENGINE_NAME.test(name); }
+        function classOf(name) { var i = name.indexOf('#'); return i < 0 ? name : name.substring(0, i); }
 
         agent.hot = {
             available: function () { return hot.installed && !!traceTarget; },
             recording: function () { return hot.recording; },
-            setRecording: function (on) { hot.recording = !!on; if (!on) hot.current.clear(); },
-            reset: function () { hot.current.clear(); hot.total.clear(); hot.peak.clear(); hot.frames = 0; },
+            setRecording: function (on) {
+                hot.recording = !!on;
+                if (!on) { hot.current.clear(); scripts.stack.length = 0; }
+            },
+            reset: function () { hot.current.clear(); hot.total.clear(); hot.peak.clear(); hot.frames = 0; scriptsReset(); },
             frames: function () { return hot.frames; },
-            top: function (n) {
-                var rows = [];
+            isProject: isProject,
+            // filter: 'all' | 'project'; byClass: sum the methods of each class.
+            top: function (n, filter, byClass) {
+                var rows = [], groups = byClass ? new Map() : null;
                 hot.total.forEach(function (total, name) {
+                    if (filter === 'project' && !isProject(name)) return;
+                    if (groups) {
+                        var key = classOf(name), g = groups.get(key);
+                        if (!g) groups.set(key, g = { name: key, total: 0, peak: 0, methods: 0 });
+                        g.total += total;
+                        g.peak = Math.max(g.peak, hot.peak.get(name) || 0);
+                        g.methods++;
+                        return;
+                    }
                     rows.push({ name: name, total: total, perFrame: hot.frames ? total / hot.frames : 0, peak: hot.peak.get(name) || 0 });
                 });
+                if (groups) groups.forEach(function (g) { g.perFrame = hot.frames ? g.total / hot.frames : 0; rows.push(g); });
                 rows.sort(function (a, b) { return b.total - a.total; });
                 return rows.slice(0, n);
+            }
+        };
+
+        // ---------- Scripts: cost of each MonoBehaviour callback and coroutine ----------
+        // The engine calls Awake/Start/OnEnable/Update/FixedUpdate/LateUpdate through its MonoBehaviour component
+        // (onAwake, onUpdate, ...) and steps coroutines with coroutine.Update(dt). Those are the engine's own JS
+        // functions (no TRACE, not project code), wrapped once: while recording, each call opens a scope that collects
+        // its time and every traced call made inside it (engine calls included), so engine work lands on the script
+        // that asked for it.
+        var CALLBACKS = { onAwake: 'Awake', onStart: 'Start', onEnable: 'OnEnable', onDisable: 'OnDisable',
+            onUpdate: 'Update', onFixedUpdate: 'FixedUpdate', onPostUpdate: 'LateUpdate' };
+        var COROUTINE_STARTS = ['addCoroutine', 'addFixedUpdateCoroutine', 'addEndOfFrameCoroutine'];
+        var scripts = { installed: false, triedAt: -1e9, stack: [], stats: new Map(), frameDirty: false, note: 'Waiting for the first script…' };
+
+        function scriptStat(key) {
+            var st = scripts.stats.get(key);
+            if (!st) scripts.stats.set(key, st = { key: key, self: 0, total: 0, calls: 0, traces: 0, frameSelf: 0, worst: 0, inner: new Map(), objects: [] });
+            return st;
+        }
+
+        function scopeEnter(key, entity) {
+            var st = scriptStat(key);
+            if (entity && st.objects.length < 6 && entity.name && st.objects.indexOf(entity.name) < 0) st.objects.push(entity.name);
+            scripts.stack.push({ st: st, t0: realNow(), child: 0, seq: hot.seq });
+            scripts.frameDirty = true;
+        }
+
+        function scopeExit() {
+            var s = scripts.stack.pop();
+            if (!s) return;
+            var dt = realNow() - s.t0;
+            s.st.total += dt;
+            s.st.self += dt - s.child;
+            s.st.frameSelf += dt - s.child;
+            s.st.calls++;
+            s.st.traces += hot.seq - s.seq;
+            var parent = scripts.stack[scripts.stack.length - 1];
+            if (parent) parent.child += dt;
+        }
+
+        function scopeTrace(name) {
+            var inner = scripts.stack[scripts.stack.length - 1].st.inner;
+            inner.set(name, (inner.get(name) || 0) + 1);
+        }
+
+        function scriptsEndFrame() {
+            scripts.stats.forEach(function (st) {
+                if (st.frameSelf > st.worst) st.worst = st.frameSelf;
+                st.frameSelf = 0;
+            });
+            scripts.frameDirty = false;
+        }
+
+        function scriptsReset() {
+            scripts.stats.clear();
+            scripts.stack.length = 0;
+            scripts.frameDirty = false;
+        }
+
+        function scriptName(code) {
+            var full = code && (code.$$fullname || (code.constructor && code.constructor.$$fullname)) || '?';
+            return full.substring(full.lastIndexOf('.') + 1);
+        }
+
+        // A coroutine is named after the project method traced just before the engine received it: Co_X() runs its
+        // TRACE when called, then StartCoroutine hands the enumerator over.
+        function coroutineName(code) {
+            for (var i = 0; i < 16; i++) {
+                var name = recent[(recentAt - i + 16) & 15];
+                if (name && isProject(name)) return name.replace('#', '.').replace(/^.*\.([^.]+\.[^.]+)$/, '$1');
+            }
+            return scriptName(code) + '.coroutine';
+        }
+
+        function wrapCoroutine(co, component) {
+            if (!co || typeof co.Update !== 'function' || co.__lunaDevTools) return;
+            var update = co.Update, key = coroutineName(component.code) + ' (coroutine)', entity = component.entity;
+            co.__lunaDevTools = true;
+            co.Update = function () {
+                if (!hot.recording) return update.apply(this, arguments);
+                scopeEnter(key, entity);
+                try { return update.apply(this, arguments); } finally { scopeExit(); }
+            };
+        }
+
+        function patchComponentPrototype(proto) {
+            Object.keys(CALLBACKS).forEach(function (method) {
+                var original = proto[method];
+                if (typeof original !== 'function') return;
+                var label = CALLBACKS[method];
+                proto[method] = function () {
+                    if (!hot.recording || !this.code) return original.apply(this, arguments);
+                    scopeEnter(scriptName(this.code) + '.' + label, this.entity);
+                    try { return original.apply(this, arguments); } finally { scopeExit(); }
+                };
+            });
+            COROUTINE_STARTS.forEach(function (method) {
+                var original = proto[method];
+                if (typeof original !== 'function') return;
+                proto[method] = function (co) {
+                    try { wrapCoroutine(co, this); } catch (e) { fail('coroutine hook', e); }
+                    return original.apply(this, arguments);
+                };
+            });
+        }
+
+        function isScriptComponent(c) { return c && c.code && typeof c.onUpdate === 'function' && typeof c.addCoroutine === 'function'; }
+
+        // Finds the engine's MonoBehaviour component class from any live script and patches it once.
+        function installScriptHooks(a) {
+            if (scripts.installed || !a) return;
+            var t = realNow();
+            if (t - scripts.triedAt < 500) return;
+            scripts.triedAt = t;
+            try {
+                var found = null, queue = [a.root], seen = 0;
+                while (queue.length && !found && seen < 4000) {
+                    var node = queue.shift();
+                    seen++;
+                    if (!node) continue;
+                    var comps = typeof node.collectAllUnityComponents === 'function' ? node.collectAllUnityComponents() : null;
+                    if (comps) for (var i = 0; i < comps.length && !found; i++) if (isScriptComponent(comps[i])) found = comps[i];
+                    if (node.children) for (var c = 0; c < node.children.length; c++) queue.push(node.children[c]);
+                }
+                if (!found) { scripts.note = 'No MonoBehaviour found yet'; return; }
+                patchComponentPrototype(Object.getPrototypeOf(found));
+                scripts.installed = true;
+                scripts.note = null;
+            } catch (e) {
+                scripts.note = 'Script hooks unavailable: ' + (e && e.message || e);
+                fail('script hooks', e);
+            }
+        }
+
+        agent.scripts = {
+            installed: function () { return scripts.installed; },
+            note: function () { return scripts.note; },
+            // Rows by self time per recorded frame; inner: the most called methods inside each scope.
+            top: function (n, innerCount) {
+                var frames = Math.max(1, hot.frames), rows = [];
+                scripts.stats.forEach(function (st) {
+                    var inner = [];
+                    st.inner.forEach(function (count, name) { inner.push({ name: name, perFrame: count / frames, project: isProject(name) }); });
+                    inner.sort(function (x, y) { return y.perFrame - x.perFrame; });
+                    rows.push({
+                        name: st.key, selfMs: st.self / frames, totalMs: st.total / frames, worstMs: st.worst,
+                        callsPerFrame: st.calls / frames, tracesPerFrame: st.traces / frames,
+                        objects: st.objects.slice(), inner: inner.slice(0, innerCount || 8)
+                    });
+                });
+                rows.sort(function (x, y) { return y.selfMs - x.selfMs; });
+                return rows.slice(0, n);
+            }
+        };
+
+        // ---------- Console: errors and warnings, deduplicated, stack frames mapped back to C# ----------
+        // Luna's compiled scripts (UnityScriptsCompiler.js) mark every method with /*Ns.Class.Method start.*/ and
+        // /*... end.*/ comments; a stack frame's line falls between the two, which gives the C# method.
+        var MAX_ENTRIES = 200;
+        var logs = { list: [], byKey: new Map(), total: 0, maps: new Map() };
+        var FRAME = /((?:https?:)?\/\/[^\s()]+?\/([^\/\s()?#]+\.js))(?:\?[^\s():]*)?:(\d+):(\d+)/g;
+
+        function textOf(args) {
+            var message = [], stack = '';
+            for (var i = 0; i < args.length; i++) {
+                var a = args[i];
+                if (a === null || a === undefined) continue;
+                if (typeof a === 'string' || typeof a === 'number' || typeof a === 'boolean') { message.push(String(a)); continue; }
+                if (typeof a.message === 'string') message.push(a.message);
+                else { try { message.push(JSON.stringify(a).slice(0, 300)); } catch (e) { message.push(String(a)); } }
+                var s = a.errorStack || a.stack;
+                if (!stack && typeof s === 'string') stack = s;
+                if (!stack && a.innerException && typeof a.innerException.stack === 'string') stack = a.innerException.stack;
+            }
+            return { message: message.join(' ').slice(0, 1000), stack: stack.slice(0, 4000) };
+        }
+
+        function frames(stack) {
+            var out = [], m;
+            FRAME.lastIndex = 0;
+            while ((m = FRAME.exec(stack)) && out.length < 30) out.push({ url: m[1], file: m[2], line: +m[3], col: +m[4] });
+            return out;
+        }
+
+        function record(level, args) {
+            try {
+                var t = textOf(args), fs = frames(t.stack);
+                var key = level + '|' + t.message + '|' + (fs[0] ? fs[0].file + ':' + fs[0].line : '');
+                var entry = logs.byKey.get(key);
+                if (!entry) {
+                    if (logs.list.length >= MAX_ENTRIES) { logs.total++; return; }
+                    var a = app;
+                    entry = { level: level, message: t.message, stack: t.stack, frames: fs, count: 0, firstFrame: a ? a.frame : -1, csharp: null };
+                    logs.byKey.set(key, entry);
+                    logs.list.push(entry);
+                    mapEntry(entry);
+                }
+                entry.count++;
+                entry.lastFrame = app ? app.frame : -1;
+                logs.total++;
+            } catch (e) { /* Never let logging fail the page. */ }
+        }
+
+        // Method ranges of a compiled script, built once per file.
+        function methodMap(url) {
+            var cached = logs.maps.get(url);
+            if (cached) return cached;
+            var entry = { ready: false, starts: [], ends: [], names: [], classes: [] };
+            logs.maps.set(url, entry);
+            try {
+                win.fetch(url).then(function (r) { return r.text(); }).then(function (text) {
+                    var lines = text.split('\n'), open = {};
+                    for (var i = 0; i < lines.length; i++) {
+                        var line = lines[i], m = /\/\*([\w.$`+<>]+) (start|end)\.\*\//.exec(line);
+                        if (m) {
+                            if (m[2] === 'start') open[m[1]] = i + 1;
+                            else if (open[m[1]]) { entry.starts.push(open[m[1]]); entry.ends.push(i + 1); entry.names.push(m[1]); delete open[m[1]]; }
+                        }
+                        var d = line.indexOf('Bridge.define("');
+                        if (d >= 0) entry.classes.push({ line: i + 1, name: line.substring(d + 15, line.indexOf('"', d + 15)) });
+                    }
+                    entry.ready = true;
+                    logs.list.forEach(mapEntry);
+                }).catch(function () { entry.ready = true; });
+            } catch (e) { entry.ready = true; }
+            return entry;
+        }
+
+        // Innermost marked range around the line. Bridge also marks whole classes: a line only inside a class range
+        // (or after a Bridge.define with no marker) is in a property, constructor or field initializer.
+        function csharpAt(map, line) {
+            var best = null;
+            if (!map.classNames) { map.classNames = new Set(); map.classes.forEach(function (c) { map.classNames.add(c.name); }); }
+            for (var i = 0; i < map.starts.length; i++)
+                if (map.starts[i] <= line && line <= map.ends[i] && (!best || map.starts[i] > best.start)) best = { start: map.starts[i], name: map.names[i] };
+            var cls = null;
+            if (!best) for (var c = 0; c < map.classes.length && map.classes[c].line <= line; c++) cls = map.classes[c].name;
+            var name = best ? best.name : cls;
+            if (!name) return null;
+            return map.classNames.has(name) ? name + ' (property / constructor)' : name;
+        }
+
+        // C# methods of the compiled-script frames (starts loading the map on first use; empty until it is ready).
+        function csharpOf(stackFrames) {
+            var names = [];
+            stackFrames.forEach(function (f) {
+                if (f.file !== 'UnityScriptsCompiler.js') return;
+                var map = methodMap(f.url);
+                if (!map.ready) return;
+                var name = csharpAt(map, f.line);
+                if (name && names[names.length - 1] !== name) names.push(name);
+            });
+            return names;
+        }
+
+        function mapsReady() {
+            var ready = true;
+            logs.maps.forEach(function (m) { if (!m.ready) ready = false; });
+            return ready;
+        }
+
+        function mapEntry(entry) {
+            var names = csharpOf(entry.frames);
+            if (names.length) entry.csharp = names;
+        }
+
+        try {
+            ['error', 'warn'].forEach(function (level) {
+                var original = win.console[level];
+                if (typeof original !== 'function') return;
+                win.console[level] = function () {
+                    record(level === 'warn' ? 'warning' : 'error', arguments);
+                    return original.apply(this, arguments);
+                };
+            });
+            win.addEventListener('error', function (ev) { record('error', [ev.error || ev.message]); });
+            win.addEventListener('unhandledrejection', function (ev) { record('error', [ev.reason]); });
+        } catch (e) {
+            fail('console hook', e);
+        }
+
+        function shortName(name) {
+            var parts = name.split('.');
+            return parts.length > 2 ? parts.slice(-2).join('.') : name;
+        }
+
+        agent.console = {
+            list: function () { return logs.list; },
+            total: function () { return logs.total; },
+            errorCount: function () { var n = 0; logs.list.forEach(function (e) { if (e.level === 'error') n++; }); return n; },
+            clear: function () { logs.list.length = 0; logs.byKey.clear(); logs.total = 0; },
+            shortName: shortName,
+            // Plain text of everything collected, for an issue tracker or an agent.
+            report: function () {
+                return logs.list.map(function (e) {
+                    return '[' + e.level + '] x' + e.count + ' (frame ' + e.firstFrame + ') ' + e.message +
+                        (e.csharp ? '\n  C#: ' + e.csharp.join(' <- ') : '') + (e.stack ? '\n  ' + e.stack.split('\n').slice(0, 8).join('\n  ') : '');
+                }).join('\n\n');
             }
         };
 
@@ -623,6 +952,7 @@
                 timing.lastRaf = ts;
                 var a = getApp();
                 if (a) {
+                    if (!scripts.installed) installScriptHooks(a);
                     if (a.frame !== timing.lastFrame) {
                         timing.lastFrame = a.frame;
                         var prev = a.counters && a.counters.previous;
@@ -697,6 +1027,379 @@
             };
         };
 
+        // ---------- Agents (MCP): commands from the Editor, over long-polling to the Dev Tools proxy ----------
+        // Reading commands use engine data (entities, components) and raw field values only: no C# method or property
+        // getter runs, so Luna's runtime analysis is unchanged. control / eval are the exceptions and say so.
+        var CHANNEL_ROUTE = '/__luna_devtools/channel', RESULT_ROUTE = '/__luna_devtools/result';
+        var channel = { id: Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4), backoff: 1000, pending: [] };
+        var watches = {}, watchSeq = 0;
+
+        function round(v, digits) {
+            if (typeof v === 'number') { var k = Math.pow(10, digits || 3); return Math.round(v * k) / k; }
+            if (v && typeof v === 'object' && !Array.isArray(v)) { var o = {}; for (var key in v) o[key] = round(v[key], digits); return o; }
+            return v;
+        }
+
+        function typeName(v) {
+            var c = v && v.constructor;
+            return (c && (c.$$fullname || c.$$name || c.name)) || typeof v;
+        }
+
+        // Own data field only: reading a C# property would run its getter (and its TRACE).
+        function own(o, key) {
+            var d = o && Object.getOwnPropertyDescriptor(o, key);
+            return d && 'value' in d ? d.value : undefined;
+        }
+
+        // Plain-JSON view of a value, depth-limited; never calls getters of C# objects.
+        function summarize(v, depth) {
+            if (v === null || v === undefined) return null;
+            var t = typeof v;
+            if (t === 'number') return isFinite(v) ? round(v, 4) : String(v);
+            if (t === 'boolean') return v;
+            if (t === 'string') return v.length > 200 ? v.slice(0, 200) + '…' : v;
+            if (t === 'function') return { function: v.$$fullname || v.name || 'function' };
+            if (Array.isArray(v) || ArrayBuffer.isView(v)) {
+                var arr = { array: v.length };
+                if (depth > 0) arr.items = Array.prototype.slice.call(v, 0, 8).map(function (x) { return summarize(x, depth - 1); });
+                return arr;
+            }
+            var x = own(v, 'x'), y = own(v, 'y'), z = own(v, 'z'), w = own(v, 'w');
+            if (typeof x === 'number' && typeof y === 'number' && Object.keys(v).length <= 6)
+                return round(typeof z === 'number' ? (typeof w === 'number' ? { x: x, y: y, z: z, w: w } : { x: x, y: y, z: z }) : { x: x, y: y }, 4);
+            var type = typeName(v), items = own(v, '_items'), size = own(v, '_size');
+            if (Array.isArray(items) && typeof size === 'number') {
+                var list = { type: type, count: size };
+                if (depth > 0) list.items = items.slice(0, Math.min(8, size)).map(function (it) { return summarize(it, depth - 1); });
+                return list;
+            }
+            var entity = own(v, 'entity'), name = own(v, 'name'), count = own(v, 'count');
+            if (entity && typeof own(entity, 'name') === 'string') return { type: type, gameObject: own(entity, 'name') };   // Engine component.
+            if (typeof name === 'string' && typeof v.getPosition === 'function') return { type: 'GameObject', name: name };   // Engine entity.
+            if (typeof count === 'number') return { type: type, count: count };
+            if (depth <= 0) return { type: type };
+            return { type: type, fields: fieldsOf(v, depth - 1, 12) };
+        }
+
+        // Own data fields as compiled from C# (Luna engine internals end with '$' and are skipped).
+        function fieldsOf(obj, depth, max) {
+            var out = {}, n = 0;
+            Object.keys(obj).forEach(function (key) {
+                if (n >= (max || 60) || key.indexOf('$') >= 0 || key.indexOf('__') === 0) return;
+                var d = Object.getOwnPropertyDescriptor(obj, key);
+                if (!d || !('value' in d) || typeof d.value === 'function') return;
+                out[key] = summarize(d.value, depth);
+                n++;
+            });
+            return out;
+        }
+
+        function scriptsOf(entity) {
+            var list = entity._unityComponents && entity._unityComponents.monoBehaviour;
+            return list ? list.filter(function (c) { return c && c.code; }) : [];
+        }
+
+        function vec(p) { return p ? round({ x: p.x, y: p.y, z: p.z }, 3) : null; }
+
+        function children(entity) { return entity.children || entity._children || []; }
+
+        // Paths name each level; siblings sharing a name get [index] among them.
+        function walk(visit, limit) {
+            var a = getApp();
+            if (!a || !a.root) throw new Error('The Luna engine has not started yet.');
+            var queue = children(a.root).map(function (e) { return { e: e, path: null }; }), at = 0;
+            label(queue, '');
+            while (at < queue.length && at < (limit || 50000)) {
+                var item = queue[at++];
+                if (visit(item.e, item.path) === false) return;
+                var next = children(item.e).map(function (e) { return { e: e }; });
+                label(next, item.path + '/');
+                for (var i = 0; i < next.length; i++) queue.push(next[i]);
+            }
+        }
+
+        function label(items, prefix) {
+            var counts = {};
+            items.forEach(function (it) { var nm = it.e.name || '?'; counts[nm] = (counts[nm] || 0) + 1; });
+            var used = {};
+            items.forEach(function (it) {
+                var nm = it.e.name || '?', k = used[nm] = (used[nm] === undefined ? 0 : used[nm] + 1);
+                it.path = prefix + nm + (counts[nm] > 1 ? '[' + k + ']' : '');
+            });
+        }
+
+        function entityAt(path) {
+            var found = null;
+            walk(function (e, p) { if (p === path) { found = e; return false; } });
+            if (!found) throw new Error('No GameObject at path "' + path + '" (paths come from luna_find_objects).');
+            return found;
+        }
+
+        function scriptOn(entity, script) {
+            var list = scriptsOf(entity);
+            var match = list.filter(function (c) { return !script || (c.code.$$fullname || '').toLowerCase().indexOf(script.toLowerCase()) >= 0; });
+            if (!match.length) throw new Error('No MonoBehaviour' + (script ? ' matching "' + script + '"' : '') + ' on that object.');
+            return match[0];
+        }
+
+        function stackHere() { return new Error().stack || ''; }
+
+        function waitForMaps(ms) {
+            return new Promise(function (resolve) {
+                var until = realNow() + ms;
+                (function check() { if (mapsReady() || realNow() > until) resolve(); else setTimeout(check, 50); })();
+            });
+        }
+
+        var commands = {
+            stats: function () {
+                var s = agent.snapshot();
+                return round({
+                    engineReady: s.ready, frame: s.frame, paused: controls.paused, timeScale: controls.scale,
+                    fps: s.interval.avg ? 1000 / s.interval.avg : 0,
+                    frameMs: s.frameMs, betweenFramesMs: s.interval,
+                    engine: s.engine, msPerFrameBySection: s.breakdown,
+                    webglPerFrame: s.gl, gpuMemoryMB: (s.glMemory.textures + s.glMemory.buffers) / 1048576,
+                    uploadsKB: { avg: s.uploads.avg / 1024, worst: s.uploads.max / 1024 },
+                    heapMB: s.heap === null ? null : s.heap / 1048576, allocMBPerSecond: s.heap === null ? null : s.allocRate / 1048576,
+                    devToolsProblems: agent.errors
+                }, 3);
+            },
+
+            errors: function (p) {
+                var level = p.level || 'all', limit = p.limit || 30;
+                var list = agent.console.list().filter(function (e) { return level === 'all' || e.level === level; })
+                    .sort(function (x, y) { return y.count - x.count; }).slice(0, limit);
+                return waitForMaps(3000).then(function () {
+                    var out = {
+                        total: agent.console.total(), distinct: agent.console.list().length,
+                        entries: list.map(function (e) {
+                            mapEntry(e);
+                            return { level: e.level, count: e.count, message: e.message, csharp: e.csharp || null,
+                                firstFrame: e.firstFrame, lastFrame: e.lastFrame, stack: e.stack ? e.stack.split('\n').slice(0, 10).join('\n') : null };
+                        })
+                    };
+                    if (p.clear) agent.console.clear();
+                    return out;
+                });
+            },
+
+            hotpaths: function (p) {
+                var seconds = Math.max(1, Math.min(30, p.seconds || 5)), filter = p.filter === 'all' ? 'all' : 'project', top = p.top || 20;
+                if (!agent.hot.available()) throw new Error('This page has no TRACE calls (not a Build Develop page?).');
+                agent.hot.reset();
+                agent.hot.setRecording(true);
+                return new Promise(function (resolve) {
+                    setTimeout(function () {
+                        agent.hot.setRecording(false);
+                        var out = {
+                            seconds: seconds, frames: agent.hot.frames(),
+                            scripts: agent.scripts.top(top, 8).map(function (r) { return round(r, 3); }),
+                            methods: agent.hot.top(top, filter).map(function (r) { return round(r, 2); }),
+                            classes: agent.hot.top(15, filter, true).map(function (r) { return round(r, 2); })
+                        };
+                        if (!agent.scripts.installed()) out.scriptHooks = agent.scripts.note();
+                        if (!out.frames) out.note = 'No frame was recorded: the game is paused, or the tab is hidden (browsers stop rendering it).';
+                        resolve(out);
+                    }, seconds * 1000);
+                });
+            },
+
+            capture: function (p) {
+                var limit = p.limit || 60;
+                return new Promise(function (resolve) {
+                    var done = false;
+                    agent.gl.captureFrame(function (list) {
+                        done = true;
+                        var byShader = {}, byTarget = {};
+                        list.forEach(function (d) {
+                            var s = byShader[d.program] = byShader[d.program] || { draws: 0, vertices: 0 };
+                            s.draws++;
+                            s.vertices += (d.count || 0) * (d.instances || 1);
+                            byTarget[d.target] = (byTarget[d.target] || 0) + 1;
+                        });
+                        resolve({
+                            draws: list.length, byShader: byShader, byTarget: byTarget,
+                            rows: list.slice(0, limit).map(function (d) {
+                                return { i: d.index, shader: d.program, count: d.count, instances: d.instances, target: d.target,
+                                    blend: d.blend, depth: d.depth, cull: d.cull, textures: d.textures };
+                            })
+                        });
+                    });
+                    setTimeout(function () { if (!done) resolve({ error: 'No frame was rendered within 5 s (paused with no redraw, or the tab is hidden).' }); }, 5000);
+                });
+            },
+
+            find: function (p) {
+                var name = (p.name || '').toLowerCase(), script = (p.script || '').toLowerCase(), limit = p.limit || 50, out = [], scanned = 0;
+                walk(function (e, path) {
+                    scanned++;
+                    if (p.activeOnly && !e.enabled) return;
+                    if (name && (e.name || '').toLowerCase().indexOf(name) < 0) return;
+                    var scripts = scriptsOf(e).map(function (c) { return c.code.$$fullname || '?'; });
+                    if (script && !scripts.some(function (s) { return s.toLowerCase().indexOf(script) >= 0; })) return;
+                    out.push({ path: path, activeSelf: e._activeSelf !== false, activeInHierarchy: !!e.enabled,
+                        position: vec(e.getPosition && e.getPosition()), scripts: scripts });
+                    if (out.length >= limit) return false;
+                });
+                return { found: out.length, scanned: scanned, objects: out };
+            },
+
+            object: function (p) {
+                var e = entityAt(p.path);
+                var kinds = {};
+                for (var k in (e._unityComponents || {})) if (e._unityComponents[k].length) kinds[k] = e._unityComponents[k].length;
+                var scripts = scriptsOf(e).filter(function (c) {
+                    return !p.script || (c.code.$$fullname || '').toLowerCase().indexOf(p.script.toLowerCase()) >= 0;
+                });
+                return {
+                    path: p.path, name: e.name, activeSelf: e._activeSelf !== false, activeInHierarchy: !!e.enabled,
+                    position: vec(e.getPosition && e.getPosition()), localPosition: vec(e.getLocalPosition && e.getLocalPosition()),
+                    children: children(e).slice(0, 60).map(function (c) { return c.name; }), childCount: children(e).length,
+                    components: kinds, engineComponents: Object.keys(e.c || {}),
+                    scripts: scripts.map(function (c) { return { class: c.code.$$fullname, enabled: c.enabled !== false, fields: fieldsOf(c.code, 1, 80) }; })
+                };
+            },
+
+            control: function (p) {
+                var c = agent.controls, ok = true;
+                if (p.action === 'pause') ok = c.setPaused(true);
+                else if (p.action === 'resume') ok = c.setPaused(false);
+                else if (p.action === 'step') ok = c.step();
+                else if (p.action === 'speed') ok = c.setScale(Math.max(0.05, Math.min(16, +p.value || 1)));
+                else if (p.action === 'restart') { setTimeout(c.restart, 150); return { restarting: true, note: 'The page reloads and reconnects as a new session.' }; }
+                else throw new Error('Unknown action ' + p.action);
+                if (!ok) throw new Error('The Luna engine has not started yet.');
+                var a = getApp();
+                return { paused: c.paused(), timeScale: c.scale(), frame: a ? a.frame : 0 };
+            },
+
+            screenshot: function (p) {
+                var canvas = agent.gl.canvas();
+                if (!canvas) throw new Error('No WebGL canvas yet.');
+                redraw();                          // The drawing buffer is valid for the rest of this task.
+                var w = Math.max(16, Math.min(p.maxWidth || 540, canvas.width)), h = Math.round(canvas.height * w / canvas.width);
+                var copy = win.document.createElement('canvas');
+                copy.width = w;
+                copy.height = h;
+                copy.getContext('2d').drawImage(canvas, 0, 0, w, h);
+                var url = copy.toDataURL('image/jpeg', 0.85), a = getApp();
+                return { base64: url.slice(url.indexOf(',') + 1), mimeType: 'image/jpeg', width: w, height: h, frame: a ? a.frame : 0 };
+            },
+
+            watch: function (p) {
+                if (!p.field) throw new Error('field is required');
+                var target, where;
+                if (p.staticType) {
+                    target = p.staticType.split('.').reduce(function (o, k) { return o ? o[k] : o; }, win);
+                    if (!target) throw new Error('No C# type ' + p.staticType + ' in this page.');
+                    where = p.staticType;
+                } else {
+                    if (!p.path) throw new Error('Give staticType, or path (+ script) for a MonoBehaviour field.');
+                    var comp = scriptOn(entityAt(p.path), p.script);
+                    target = comp.code;
+                    where = p.path + ' / ' + comp.code.$$fullname;
+                }
+                var desc = Object.getOwnPropertyDescriptor(target, p.field);
+                if (!desc) throw new Error('No field "' + p.field + '" on ' + where + '. Fields: ' + Object.keys(fieldsOf(target, 0, 80)).join(', '));
+                if (!('value' in desc)) throw new Error('"' + p.field + '" is a property or already watched; watch its backing field.');
+                var id = 'w' + (++watchSeq), value = desc.value, hits = [], max = p.maxHits || 30, total = 0;
+                Object.defineProperty(target, p.field, {
+                    configurable: true, enumerable: desc.enumerable,
+                    get: function () { return value; },
+                    set: function (v) {
+                        total++;
+                        if (hits.length < max) {
+                            var a = getApp();
+                            hits.push({ frame: a ? a.frame : -1, previous: summarize(value, 1), value: summarize(v, 1), stack: stackHere() });
+                        }
+                        value = v;
+                    }
+                });
+                watches[id] = {
+                    where: where, field: p.field, hits: hits, total: function () { return total; },
+                    restore: function () { Object.defineProperty(target, p.field, { value: value, writable: true, configurable: true, enumerable: desc.enumerable }); }
+                };
+                return { id: id, watching: where + '.' + p.field, current: summarize(value, 1) };
+            },
+
+            watchHits: function (p) {
+                var w = watches[p.id];
+                if (!w) throw new Error('No watch ' + p.id + ' (the page may have reloaded).');
+                w.hits.forEach(function (h) { csharpOf(frames(h.stack)); });          // Starts loading the maps.
+                return waitForMaps(3000).then(function () {
+                    var out = {
+                        watching: w.where + '.' + w.field, assignments: w.total(),
+                        hits: w.hits.map(function (h) {
+                            var cs = csharpOf(frames(h.stack));
+                            return { frame: h.frame, previous: h.previous, value: h.value, csharp: cs.length ? cs : null,
+                                stack: h.stack.split('\n').slice(2, 10).join('\n') };
+                        })
+                    };
+                    if (p.remove) { w.restore(); delete watches[p.id]; out.removed = true; }
+                    return out;
+                });
+            },
+
+            eval: function (p) {
+                var fn = new win.Function('agent', 'app', p.code || '');
+                return Promise.resolve(fn(agent, getApp())).then(function (v) { return { result: summarize(v, 3) }; });
+            }
+        };
+
+        function hello() {
+            var a = getApp();
+            return { url: win.location.href, title: win.document && win.document.title, userAgent: win.navigator && win.navigator.userAgent,
+                engineReady: !!a, frame: a ? a.frame : 0 };
+        }
+
+        function post(route, payload) {
+            return win.fetch(route + '?session=' + encodeURIComponent(channel.id), {
+                method: 'POST', cache: 'no-store', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+            });
+        }
+
+        function deliver(result) {
+            post(RESULT_ROUTE, { results: [result] }).catch(function () { channel.pending.push(result); });
+        }
+
+        function runCommand(cmd) {
+            new Promise(function (resolve) {
+                var handler = commands[cmd.method];
+                if (!handler) throw new Error('Unknown command ' + cmd.method);
+                resolve(handler(cmd.params || {}));
+            }).then(function (result) {
+                deliver({ id: cmd.id, ok: true, result: result === undefined ? null : result });
+            }, function (e) {
+                deliver({ id: cmd.id, ok: false, error: String(e && e.message || e) });
+            });
+        }
+
+        function pollLoop() {
+            var results = channel.pending;
+            channel.pending = [];
+            post(CHANNEL_ROUTE, { hello: hello(), results: results }).then(function (r) { return r.json(); }).then(function (reply) {
+                channel.backoff = 1000;
+                (reply.commands || []).forEach(runCommand);
+                setTimeout(pollLoop, 0);
+            }).catch(function () {
+                channel.pending = results.concat(channel.pending);
+                setTimeout(pollLoop, channel.backoff);      // Proxy restarting (Unity reload) or gone: retry, slower each time.
+                channel.backoff = Math.min(channel.backoff * 2, 15000);
+            });
+        }
+
+        agent.commands = commands;
+        agent.session = channel.id;
+        // Only through the Dev Tools proxy (same origin as this script), which is where the channel lives.
+        try {
+            var here = win.location && win.location.origin;
+            if (here && src.indexOf(here + '/__luna_devtools/') === 0 && typeof win.fetch === 'function')
+                setTimeout(pollLoop, 500);
+        } catch (e) {
+            fail('agent channel', e);
+        }
+
         return agent;
     }
 
@@ -722,7 +1425,7 @@
             '.title{font-weight:600;font-size:12px;flex:1}',
             '.x{cursor:pointer;opacity:.7;padding:0 4px}.x:hover{opacity:1}',
             '.tabs{display:flex;border-bottom:1px solid rgba(255,255,255,.08)}',
-            '.tab{flex:1;text-align:center;padding:5px 0;cursor:pointer;opacity:.65}.tab.on{opacity:1;box-shadow:inset 0 -2px #4f8ff7}',
+            '.tab{flex:1;text-align:center;padding:5px 0;cursor:pointer;opacity:.65}.tab.on{opacity:1;box-shadow:inset 0 -2px #4f8ff7}.tab.bad{color:#ef6a5a}',
             '.body{overflow:auto;padding:8px;flex:1}',
             '.grid{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:4px 0 8px}',
             '.k{opacity:.62}.v{font-variant-numeric:tabular-nums;text-align:right}',
@@ -740,7 +1443,14 @@
             'tr.click{cursor:pointer}tr.click:hover td{background:rgba(79,143,247,.15)}tr.sel td{background:rgba(79,143,247,.3)}',
             '.note{opacity:.6;font-size:10.5px;line-height:1.35;margin:4px 0}',
             '.warn{color:#f0b54a}.bad{color:#ef6a5a}.good{color:#6cc070}',
-            '.scroll{max-height:260px;overflow:auto;border:1px solid rgba(255,255,255,.06);border-radius:4px}'
+            '.scroll{max-height:260px;overflow:auto;border:1px solid rgba(255,255,255,.06);border-radius:4px}',
+            '.log{border-left:3px solid #ef6a5a;padding:3px 6px;margin:4px 0;background:rgba(255,255,255,.03);border-radius:3px}',
+            '.log.warning{border-left-color:#f0b54a}',
+            '.log .msg{white-space:pre-wrap;word-break:break-word}',
+            '.log .cs{color:#8fb8ff;margin-top:2px;word-break:break-word}',
+            'details summary{cursor:pointer;opacity:.6;font-size:10.5px}',
+            'pre{white-space:pre-wrap;word-break:break-all;font-size:10px;opacity:.75;margin:2px 0}',
+            '.inner{padding:2px 0 4px 10px;font-size:10.5px;opacity:.8}'
         ].join('\n');
 
         var where = inPlayable ? 'playable.' : 'shell.';
@@ -752,7 +1462,7 @@
             '<div class="panel" style="display:none">' +
             '<div class="head"><span class="title">Luna Dev Tools</span><span class="x" title="Hide (` key)">✕</span></div>' +
             '<div class="tabs"><div class="tab" data-tab="stats">Stats</div><div class="tab" data-tab="frame">Frame</div>' +
-            '<div class="tab" data-tab="hot">Hot paths</div><div class="tab" data-tab="controls">Controls</div></div>' +
+            '<div class="tab" data-tab="hot">Hot paths</div><div class="tab" data-tab="errors">Errors</div><div class="tab" data-tab="controls">Controls</div></div>' +
             '<div class="body"></div></div>';
         (doc.body || doc.documentElement).appendChild(host);
 
@@ -842,6 +1552,7 @@
 
         // ---------- Tabs ----------
         var selectedDraw = -1, actionMessage = '', endCardName = load('endCard', 'EndCard'), seenCallbacks = [];
+        var hotFilter = load('hotFilter', 'project'), hotByClass = load('hotByClass', false), expandedScript = null;
 
         function statsTab(a, s) {
             var e = s.engine || {};
@@ -915,24 +1626,57 @@
             return html;
         }
 
+        function perFrame(v) { return v < 10 ? v.toFixed(2) : n(v); }
+
         function hotTab(a, s) {
-            var html = '<div class="sec">Most called methods</div>';
+            var html = '';
             if (!a.hot.available()) {
-                html += '<div class="note warn">Call counts need the develop build\'s TRACE calls, which were not found.</div>';
+                return '<div class="note warn">Hot paths need the develop build\'s TRACE calls, which were not found.</div>';
+            }
+            html += '<div class="row"><button data-act="record" class="' + (a.hot.recording() ? 'on' : '') + '">' + (a.hot.recording() ? 'Stop' : 'Record') + '</button>' +
+                '<button data-act="hotreset">Reset</button><span class="note">' + n(a.hot.frames()) + ' frames recorded</span></div>';
+
+            // Scripts: where the frame's script time and engine calls come from.
+            html += '<div class="sec">Scripts (per frame)</div>';
+            if (!a.scripts.installed()) html += '<div class="note">' + esc(a.scripts.note() || 'Script hooks not installed') + '</div>';
+            var scriptRows = a.scripts.top(30, 8);
+            if (scriptRows.length) {
+                html += '<div class="scroll"><table><tr><th>Script.callback</th><th title="Time in the callback itself">self ms</th>' +
+                    '<th title="Including callbacks it triggered (OnEnable of objects it turned on, ...)">total</th>' +
+                    '<th title="Worst frame, self time">worst</th><th title="Traced calls made inside, engine included">calls</th></tr>';
+                scriptRows.forEach(function (r) {
+                    var open = expandedScript === r.name;
+                    html += '<tr class="click' + (open ? ' sel' : '') + '" data-script="' + esc(r.name) + '" title="' + esc(r.name +
+                        (r.objects.length ? '\nOn: ' + r.objects.join(', ') : '') + '\n' + perFrame(r.callsPerFrame) + ' call(s) / frame') + '"><td>' + esc(r.name) +
+                        '</td><td class="' + cls(r.selfMs, 1, 3) + '">' + r.selfMs.toFixed(3) + '</td><td>' + r.totalMs.toFixed(3) +
+                        '</td><td>' + r.worstMs.toFixed(2) + '</td><td class="' + cls(r.tracesPerFrame, 500, 2000) + '">' + perFrame(r.tracesPerFrame) + '</td></tr>';
+                    if (open) {
+                        html += '<tr><td colspan="5"><div class="inner">' + (r.objects.length ? 'On: ' + esc(r.objects.join(', ')) + '<br>' : '') +
+                            (r.inner.length ? r.inner.map(function (i) {
+                                return (i.project ? '<b>' : '') + esc(i.name) + (i.project ? '</b>' : '') + ' — ' + perFrame(i.perFrame) + '/frame';
+                            }).join('<br>') : 'No traced call inside') + '</div></td></tr>';
+                    }
+                });
+                html += '</table></div><div class="note">Click a row for the calls made inside it (project methods in bold). ' +
+                    'Engine work such as Transform.handle is counted on the script that triggered it.</div>';
+            } else if (a.scripts.installed()) {
+                html += '<div class="note">Press Record and play.</div>';
+            }
+
+            // Methods, project only by default.
+            html += '<div class="sec">Most called methods</div><div class="row">' +
+                '<button data-act="hotfilter" class="' + (hotFilter === 'project' ? 'on' : '') + '">Project only</button>' +
+                '<button data-act="hotclass" class="' + (hotByClass ? 'on' : '') + '">By class</button></div>';
+            var rows = a.hot.top(40, hotFilter, hotByClass);
+            if (rows.length) {
+                html += '<div class="scroll"><table><tr><th>' + (hotByClass ? 'Class' : 'Class#method') + '</th><th>/frame</th><th>peak</th><th>total</th></tr>';
+                rows.forEach(function (r) {
+                    html += '<tr title="' + esc(r.name + (r.methods ? '\n' + r.methods + ' method(s)' : '')) + '"><td>' + esc(r.name) + '</td><td class="' + cls(r.perFrame, 100, 1000) + '">' +
+                        perFrame(r.perFrame) + '</td><td>' + n(r.peak) + '</td><td>' + n(r.total) + '</td></tr>';
+                });
+                html += '</table></div>';
             } else {
-                html += '<div class="row"><button data-act="record" class="' + (a.hot.recording() ? 'on' : '') + '">' + (a.hot.recording() ? 'Stop' : 'Record') + '</button>' +
-                    '<button data-act="hotreset">Reset</button><span class="note">' + n(a.hot.frames()) + ' frames recorded</span></div>';
-                var rows = a.hot.top(40);
-                if (rows.length) {
-                    html += '<div class="scroll"><table><tr><th>Class#method</th><th>/frame</th><th>peak</th><th>total</th></tr>';
-                    rows.forEach(function (r) {
-                        html += '<tr title="' + esc(r.name) + '"><td>' + esc(r.name) + '</td><td class="' + cls(r.perFrame, 100, 1000) + '">' +
-                            (r.perFrame < 10 ? r.perFrame.toFixed(2) : n(r.perFrame)) + '</td><td>' + n(r.peak) + '</td><td>' + n(r.total) + '</td></tr>';
-                    });
-                    html += '</table></div>';
-                } else {
-                    html += '<div class="note">Press Record and play: every project method call is counted per frame.</div>';
-                }
+                html += '<div class="note">' + (a.hot.frames() ? 'No ' + (hotFilter === 'project' ? 'project ' : '') + 'call recorded.' : 'Press Record and play: every method call is counted per frame.') + '</div>';
             }
             var b = s.breakdown;
             if (b) {
@@ -946,6 +1690,22 @@
             }
             html += '<div class="note">Time per method: Chrome DevTools (F12) → Performance → Record while playing, then Bottom-Up. ' +
                 'Project methods keep their C# names (Namespace.Class.Method).</div>';
+            return html;
+        }
+
+        function errorsTab(a) {
+            var list = a.console.list().slice().sort(function (x, y) { return (x.level === y.level ? 0 : x.level === 'error' ? -1 : 1) || y.count - x.count; });
+            var html = '<div class="row"><button data-act="copylogs"' + (list.length ? '' : ' disabled') + '>Copy all</button>' +
+                '<button data-act="clearlogs"' + (list.length ? '' : ' disabled') + '>Clear</button>' +
+                '<span class="note">' + n(a.console.total()) + ' message(s), ' + list.length + ' distinct</span></div>';
+            if (!list.length) return html + '<div class="note">No error or warning logged by the playable.</div>';
+            list.slice(0, 60).forEach(function (e) {
+                html += '<div class="log ' + e.level + '"><div class="msg">×' + n(e.count) + '  ' + esc(e.message) + '</div>' +
+                    (e.csharp ? '<div class="cs">C#: ' + e.csharp.slice(0, 4).map(function (c) { return esc(a.console.shortName(c)); }).join(' ← ') + '</div>' : '') +
+                    (e.stack ? '<details><summary>stack · first at frame ' + n(e.firstFrame) + '</summary><pre>' + esc(e.stack.split('\n').slice(0, 12).join('\n')) + '</pre>' +
+                        (e.csharp ? '<pre>' + esc(e.csharp.join('\n')) + '</pre>' : '') + '</details>' : '') + '</div>';
+            });
+            if (actionMessage) html += '<div class="note">' + esc(actionMessage) + '</div>';
             return html;
         }
 
@@ -989,7 +1749,8 @@
             }
             for (i = from.attributes.length - 1; i >= 0; i--) {
                 attr = from.attributes[i];
-                if (!to.hasAttribute(attr.name)) from.removeAttribute(attr.name);
+                // A <details> the user opened stays open across refreshes.
+                if (!to.hasAttribute(attr.name) && !(attr.name === 'open' && from.tagName === 'DETAILS')) from.removeAttribute(attr.name);
             }
             // Common children are updated in place; only the tail is added or removed.
             var a = from.childNodes, b = to.childNodes, common = Math.min(a.length, b.length);
@@ -1020,7 +1781,13 @@
             var s = a.snapshot();
             if (!s.ready) { show('<div class="note">Waiting for the Luna engine to start…</div>'); return; }
 
-            show(tab === 'frame' ? frameTab(a, s) : tab === 'hot' ? hotTab(a, s) : tab === 'controls' ? controlsTab(a) : statsTab(a, s));
+            var errorCount = a.console.errorCount(), errorTab = root.querySelector('.tab[data-tab=errors]');
+            var errorLabel = errorCount ? 'Errors (' + errorCount + ')' : 'Errors';
+            if (errorTab.textContent !== errorLabel) errorTab.textContent = errorLabel;
+            errorTab.classList.toggle('bad', errorCount > 0);
+
+            show(tab === 'frame' ? frameTab(a, s) : tab === 'hot' ? hotTab(a, s) : tab === 'errors' ? errorsTab(a) :
+                tab === 'controls' ? controlsTab(a) : statsTab(a, s));
 
             var fg = body.querySelector('canvas[data-g=frame]');
             if (fg) graph(fg, s.frameHistory, 34, [16.7, 33.3], '#4f8ff7');
@@ -1047,6 +1814,13 @@
             body.querySelectorAll('[data-scale]').forEach(function (el) {
                 el.onclick = function () { a.controls.setScale(parseFloat(el.getAttribute('data-scale'))); render(true); };
             });
+            body.querySelectorAll('tr[data-script]').forEach(function (el) {
+                el.onclick = function () {
+                    var name = el.getAttribute('data-script');
+                    expandedScript = expandedScript === name ? null : name;
+                    render(true);
+                };
+            });
             body.querySelectorAll('tr[data-draw]').forEach(function (el) {
                 el.onclick = function () {
                     selectedDraw = parseInt(el.getAttribute('data-draw'), 10);
@@ -1072,10 +1846,31 @@
             }
             else if (act === 'capture') a.gl.captureFrame(function () { selectedDraw = -1; render(true); });
             else if (act === 'record') a.hot.setRecording(!a.hot.recording());
-            else if (act === 'hotreset') a.hot.reset();
+            else if (act === 'hotreset') { a.hot.reset(); expandedScript = null; }
+            else if (act === 'hotfilter') { hotFilter = hotFilter === 'project' ? 'all' : 'project'; save('hotFilter', hotFilter); }
+            else if (act === 'hotclass') { hotByClass = !hotByClass; save('hotByClass', hotByClass); }
+            else if (act === 'clearlogs') a.console.clear();
+            else if (act === 'copylogs') copyText(a.console.report());
             else if (act === 'activate') actionMessage = a.controls.activate(endCardName.trim());
             else if (act === 'spector') loadSpector(a);
             render(true);
+        }
+
+        function copyText(text) {
+            var done = function () { actionMessage = 'Copied ' + text.length + ' characters.'; render(true); };
+            var fallback = function () {
+                var area = doc.createElement('textarea');
+                area.value = text;
+                area.style.cssText = 'position:fixed;left:-9999px;top:0';
+                root.appendChild(area);
+                area.select();
+                try { doc.execCommand('copy'); done(); } catch (e) { actionMessage = 'Copy failed: ' + (e && e.message || e); }
+                root.removeChild(area);
+            };
+            try {
+                if (hostWin.navigator.clipboard && hostWin.isSecureContext) hostWin.navigator.clipboard.writeText(text).then(done, fallback);
+                else fallback();
+            } catch (e) { fallback(); }
         }
 
         // Spector.js has to run in the playable's own page: it does not recognise a canvas from another window.

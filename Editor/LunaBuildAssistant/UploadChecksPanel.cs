@@ -191,6 +191,21 @@ namespace Supercent.Util.Editor
                     GUILayout.Label(new GUIContent(rule.Title, rule.Fix), EditorStyles.boldLabel);
                     GUILayout.Label(AssistantUI.Icon("_Help", rule.Id + "\n\n" + rule.Fix), GUILayout.Width(18), GUILayout.Height(18));
                     GUILayout.FlexibleSpace();
+                    if (issues.Count > 0 && rule is ILunaLintFixable fixable
+                        && GUILayout.Button(new GUIContent(fixable.FixLabel, fixable.FixConfirm), EditorStyles.miniButton)
+                        && EditorUtility.DisplayDialog(rule.Title, fixable.FixConfirm, fixable.FixLabel, "Cancel"))
+                    {
+                        try
+                        {
+                            fixable.Apply(issues);
+                        }
+                        catch (Exception e)
+                        {
+                            Debug.LogException(e);
+                        }
+                        lintStale = true;
+                        GUIUtility.ExitGUI();
+                    }
                     GUILayout.Label(issues.Count == 0 ? "OK" : issues.Count.ToString(), AssistantUI.Caption);
                 }
                 for (int i = 0; i < issues.Count; i++)

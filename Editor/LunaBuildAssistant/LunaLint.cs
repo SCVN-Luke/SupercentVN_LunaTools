@@ -21,6 +21,14 @@ namespace Supercent.Util.Editor
         IEnumerable<LunaLint.Issue> Run();
     }
 
+    // A rule whose issues the Assistant can fix in place (Checks page: "Fix all").
+    public interface ILunaLintFixable : ILunaLintRule
+    {
+        string FixLabel { get; }                            // Button text, e.g. "Turn off probes".
+        string FixConfirm { get; }                          // Dialog text before applying.
+        void Apply(IList<LunaLint.Issue> issues);
+    }
+
     public static class LunaLint
     {
         const string IgnoreFile = "Library/SupercentVN/LunaLintIgnore.txt";

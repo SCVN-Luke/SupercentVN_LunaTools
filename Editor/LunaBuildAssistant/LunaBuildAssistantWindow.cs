@@ -347,6 +347,13 @@ namespace Supercent.Util.Editor
             if (devTools != LunaDevTools.Enabled)
                 LunaDevTools.Enabled = devTools;
             DrawDevTools();
+            bool mcp = EditorGUILayout.ToggleLeft(new GUIContent("MCP server for AI agents",
+                "Lets an agent (Claude Code, ...) debug the running Build Develop page and drive builds: errors with C# stacks, " +
+                "frame stats, hot paths, frame capture, scene reading, field watches, Build Develop, Luna checks, source lookup.\n\n" +
+                "Served by the Dev Tools proxy to this machine only, and started again with Unity."), LunaMcp.Enabled);
+            if (mcp != LunaMcp.Enabled)
+                LunaMcp.Enabled = mcp;
+            DrawMcp();
 
             EditorGUILayout.Space(14);
             if (AssistantUI.PrimaryButton("Clear Cache & Build Develop"))
@@ -389,6 +396,29 @@ namespace Supercent.Util.Editor
                             LunaDevTools.Open();
                     if (LunaDevTools.LastError != null)
                         GUILayout.Label(new GUIContent(LunaDevTools.LastError, LunaDevTools.LastError), AssistantUI.Caption);
+                }
+                GUILayout.FlexibleSpace();
+            }
+        }
+
+        // MCP address and the command that registers it in Claude Code.
+        static void DrawMcp()
+        {
+            if (!LunaMcp.Enabled)
+                return;
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                GUILayout.Space(18);
+                string url = LunaMcp.Url;
+                if (url == null)
+                    GUILayout.Label(new GUIContent("MCP: not running" + (LunaDevTools.LastError != null ? " (" + LunaDevTools.LastError + ")" : string.Empty)), AssistantUI.Caption);
+                else
+                {
+                    int pages = LunaMcp.ConnectedPages;
+                    GUILayout.Label(new GUIContent($"MCP: {url}   {pages} page(s) connected",
+                        "Pages connect when the Build Develop page is opened through the Dev Tools."), AssistantUI.Caption);
+                    if (EditorGUILayout.LinkButton(new GUIContent("Copy Claude Code command", LunaMcp.ClaudeCommand)))
+                        EditorGUIUtility.systemCopyBuffer = LunaMcp.ClaudeCommand;
                 }
                 GUILayout.FlexibleSpace();
             }
@@ -604,12 +634,40 @@ namespace Supercent.Util.Editor
             conceptName = ConceptNaming.Suggest(concepts.Select(c => c.Name), appName, branch, DateTime.Now, suffix);
         }
 
-        async void BuildPrivate(bool openBrowser)
+        // Build Develop asked by an agent (MCP unity_build_develop): read from the MCP request thread.
+        static volatile bool agentBuildRunning;
+        public static bool AgentBuildRunning => agentBuildRunning;
+        public static BuildReport AgentBuildReport { get; private set; }
+        public static string AgentBuildStatus { get; private set; }
+        public static double AgentBuildSeconds { get; private set; }
+
+        // Main thread. Null when started, otherwise why not.
+        public static string StartAgentBuild(bool openPage)
+        {
+            var window = GetWindow<LunaBuildAssistantWindow>("Luna Build Assistant");
+            if (window.building || agentBuildRunning)
+                return "A build is already running.";
+            if (!LunaPluginBridge.IsAvailable)
+                return "The Unity Playworks Plugin cannot be used: " + LunaPluginBridge.BlockedReason;
+            // An agent edits scripts while Unity is in the background, where nothing is imported: pick the files
+            // up first, otherwise the build uses old code or Unity reloads the domain in the middle of it.
+            AssetDatabase.Refresh();
+            if (EditorApplication.isCompiling || EditorApplication.isUpdating)
+                return "Unity is importing / compiling changed scripts. Call again in a few seconds (the MCP server comes back after the reload).";
+            AgentBuildReport = null;
+            AgentBuildStatus = null;
+            agentBuildRunning = true;
+            window.BuildPrivate(openPage, true);
+            return null;
+        }
+
+        async void BuildPrivate(bool openBrowser, bool forAgent = false)
         {
             const string action = "Build Develop";
             building = true;
             status = null;
             report = null;
+            DateTime started = DateTime.UtcNow;
             try
             {
                 // The plugin only builds signed in; say so here instead of in its window.
@@ -630,17 +688,31 @@ namespace Supercent.Util.Editor
                 ProjectBuildState.MarkPrivateBuilt();
                 status = "Build Develop finished at " + DateTime.Now.ToString("HH:mm") + ".";
                 changesCheckedAt = 0;
-                if (openBrowser || EditorUtility.DisplayDialog("Build Finished", "Would you like to open the playable in the browser?", "Open in browser", "Close"))
+                if (forAgent)
+                {
+                    if (openBrowser)
+                        LunaDevTools.Open();       // Through the Dev Tools, so the page connects to the agent.
+                }
+                else if (openBrowser || EditorUtility.DisplayDialog("Build Finished", "Would you like to open the playable in the browser?", "Open in browser", "Close"))
                     OpenPlayable();
                 await EstimateSize();
             }
             catch (Exception e)
             {
+                if (forAgent)
+                    AgentBuildStatus = "Build failed with an exception: " + e.Message;
                 Fail(e);
             }
             finally
             {
                 building = false;
+                if (forAgent)
+                {
+                    AgentBuildReport = report;
+                    AgentBuildStatus = AgentBuildStatus ?? status;
+                    AgentBuildSeconds = (DateTime.UtcNow - started).TotalSeconds;
+                    agentBuildRunning = false;
+                }
                 Repaint();
             }
         }
