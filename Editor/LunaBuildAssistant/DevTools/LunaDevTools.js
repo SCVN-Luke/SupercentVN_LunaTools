@@ -11,7 +11,8 @@
  *
  * Rules that keep Luna's runtime analysis (which decides what code the cloud build strips) exactly as without it:
  *   - no game function is wrapped or replaced; call counts come from the TRACE hook Luna already calls,
- *     forwarded unchanged with the same arguments and return value;
+ *     forwarded unchanged with the same arguments and return value. The one exception, static initializers, are
+ *     wrapped to report the exceptions Luna hides, calling through unchanged and rethrowing;
  *   - the engine's time scale / pause are only touched after a button press, and restored afterwards;
  *   - WebGL calls are wrapped on the context only to count them; a draw is skipped only while the
  *     "draw limit" slider is set.
@@ -448,11 +449,105 @@
                     return original.apply(this, arguments);
                 };
             });
-            win.addEventListener('error', function (ev) { record('error', [ev.error || ev.message]); });
+            win.addEventListener('error', function (ev) {
+                if (!(ev.error && ev.error.__lunaDevToolsStatic)) record('error', [ev.error || ev.message]);
+            });
             win.addEventListener('unhandledrejection', function (ev) { record('error', [ev.reason]); });
         } catch (e) {
             fail('console hook', e);
         }
+
+        // ---------- Static constructors ----------
+        // Bridge runs a class's static initializer (C# static constructor + static field initializers) once, the first
+        // time the class is used, and what it throws while Luna starts is swallowed: the class keeps null / default
+        // statics for the whole session with no message. Initializers are wrapped only to report that: same this and
+        // arguments, the exception rethrown, no TRACE call added, so the game and runtime analysis are unchanged.
+        // Right after bridge.js has run (a script's load event fires before the next deferred script runs) Bridge's type
+        // registration is hooked; after each script the classes defined so far are wrapped too.
+        // (Bridge.define itself can't be hooked: Luna's runtime analysis replaces that property with its own accessor.)
+        var statics = { wrapped: 0, ran: 0, failed: [] }, ranTypes = typeof WeakSet === 'function' ? new WeakSet() : null;
+
+        function wrapStaticInit(type) {
+            var init = type && type.$staticInit;
+            if (typeof init !== 'function' || init.__lunaDevTools) return;
+            var wrapper = function () {
+                statics.ran++;
+                if (ranTypes) ranTypes.add(type);
+                try {
+                    return init.apply(this, arguments);
+                } catch (e) {
+                    try {
+                        var name = type.$$fullname || type.$$name || '?', message = String(e && e.message || e);
+                        statics.failed.push({ type: name, message: message, frame: app ? app.frame : -1 });
+                        if (e && typeof e === 'object') e.__lunaDevToolsStatic = true;
+                        record('error', [{ message: 'Static constructor of ' + name + ' failed: ' + message + ' (Luna does not report it; ' +
+                            'the static fields of ' + name + ' stay null / default for the rest of the session)', stack: e && e.stack || '' }]);
+                    } catch (x) { /* Reporting must not change what the game sees. */ }
+                    throw e;
+                }
+            };
+            wrapper.__lunaDevTools = true;
+            type.$staticInit = wrapper;
+            statics.wrapped++;
+        }
+
+        // Bridge.define calls Bridge.Class.registerType(name, type) once the type's initializer is set (every class of an
+        // assembly, static-only ones included), and generic instantiations go through Bridge.Class.$queue.push: both
+        // wrap the class as soon as it exists, so even a class used by a later line of the same script is covered.
+        function hookRegister(cls) {
+            var register = cls.registerType;
+            if (typeof register !== 'function' || register.__lunaDevTools) return;
+            var wrapped = function (name, type) {
+                try { wrapStaticInit(type); } catch (e) { /* Not a class. */ }
+                return register.apply(this, arguments);
+            };
+            wrapped.__lunaDevTools = true;
+            cls.registerType = wrapped;
+        }
+
+        function hookQueue(list) {
+            if (!list || list.__lunaDevTools) return;
+            var push = list.push;
+            Object.defineProperty(list, 'push', {
+                configurable: true, writable: true, enumerable: false,
+                value: function () {
+                    for (var i = 0; i < arguments.length; i++) {
+                        try { wrapStaticInit(arguments[i]); } catch (e) { /* Not a class. */ }
+                    }
+                    return push.apply(this, arguments);
+                }
+            });
+            Object.defineProperty(list, '__lunaDevTools', { value: true });
+        }
+
+        function wrapDefinedClasses() {
+            try {
+                var cls = win.Bridge && win.Bridge.Class;
+                if (!cls) return;
+                hookRegister(cls);
+                [cls.$queue, cls.$queueEntry].forEach(function (list) {
+                    if (!list) return;
+                    hookQueue(list);
+                    for (var i = 0; i < list.length; i++) wrapStaticInit(list[i]);
+                });
+                var assembly = win.Bridge.$currentAssembly, types = assembly && assembly.$types;   // Defined before the hooks.
+                if (types) for (var name in types) if (Object.prototype.hasOwnProperty.call(types, name)) wrapStaticInit(types[name]);
+            } catch (e) {
+                fail('static constructor hook', e);
+            }
+        }
+
+        try {
+            win.document.addEventListener('load', function (ev) {
+                if (ev.target && ev.target.tagName === 'SCRIPT') wrapDefinedClasses();
+            }, true);
+            win.document.addEventListener('DOMContentLoaded', wrapDefinedClasses);
+        } catch (e) {
+            fail('static constructor hook', e);
+        }
+        agent.statics = statics;
+        agent.statics.scan = wrapDefinedClasses;
+        agent.statics.observed = function (type) { return !!(ranTypes && ranTypes.has(type)); };
 
         function shortName(name) {
             var parts = name.split('.');
@@ -1031,7 +1126,27 @@
         // Reading commands use engine data (entities, components) and raw field values only: no C# method or property
         // getter runs, so Luna's runtime analysis is unchanged. control / eval are the exceptions and say so.
         var CHANNEL_ROUTE = '/__luna_devtools/channel', RESULT_ROUTE = '/__luna_devtools/result';
-        var channel = { id: Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4), backoff: 1000, pending: [] };
+        function newId() { return Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4); }
+        // A tab keeps its session across reloads (sessionStorage), so an agent's session id stays valid; loadId tells
+        // the loads apart. A duplicated tab copies sessionStorage: it asks the other tabs and takes a new id if taken.
+        var SESSION_KEY = 'lunaDevTools.session';
+        var channel = { id: null, loadId: newId(), loadedAt: Date.now(), backoff: 1000, pending: [] };
+        try { channel.id = win.sessionStorage.getItem(SESSION_KEY); } catch (e) { /* Storage blocked. */ }
+        if (!channel.id || channel.id.length > 40) channel.id = newId();
+        function keepSessionId() { try { win.sessionStorage.setItem(SESSION_KEY, channel.id); } catch (e) { /* Storage blocked. */ } }
+        function claimSession(then) {
+            var bus = null;
+            try { bus = typeof win.BroadcastChannel === 'function' ? new win.BroadcastChannel('lunaDevTools.sessions') : null; } catch (e) { bus = null; }
+            if (!bus) { keepSessionId(); then(); return; }
+            var askId = channel.id;
+            bus.onmessage = function (ev) {
+                var m = ev.data || {};
+                if (m.ask === channel.id && m.loadId !== channel.loadId) bus.postMessage({ taken: channel.id, loadId: channel.loadId });
+                else if (m.taken === askId && m.loadId !== channel.loadId && channel.id === askId) channel.id = newId();
+            };
+            bus.postMessage({ ask: askId, loadId: channel.loadId });
+            setTimeout(function () { keepSessionId(); then(); }, 300);
+        }
         var watches = {}, watchSeq = 0;
 
         function round(v, digits) {
@@ -1173,6 +1288,7 @@
                 return waitForMaps(3000).then(function () {
                     var out = {
                         total: agent.console.total(), distinct: agent.console.list().length,
+                        staticConstructorFailures: statics.failed.slice(0, 20),
                         entries: list.map(function (e) {
                             mapEntry(e);
                             return { level: e.level, count: e.count, message: e.message, csharp: e.csharp || null,
@@ -1267,7 +1383,7 @@
                 else if (p.action === 'resume') ok = c.setPaused(false);
                 else if (p.action === 'step') ok = c.step();
                 else if (p.action === 'speed') ok = c.setScale(Math.max(0.05, Math.min(16, +p.value || 1)));
-                else if (p.action === 'restart') { setTimeout(c.restart, 150); return { restarting: true, note: 'The page reloads and reconnects as a new session.' }; }
+                else if (p.action === 'restart') { setTimeout(c.restart, 150); return { restarting: true, note: 'The page reloads and reconnects with the same session; luna_reload waits for it.' }; }
                 else throw new Error('Unknown action ' + p.action);
                 if (!ok) throw new Error('The Luna engine has not started yet.');
                 var a = getApp();
@@ -1344,13 +1460,95 @@
             eval: function (p) {
                 var fn = new win.Function('agent', 'app', p.code || '');
                 return Promise.resolve(fn(agent, getApp())).then(function (v) { return { result: summarize(v, 3) }; });
+            },
+
+            simulate: function (p) { return simulate(p); },
+
+            reload: function () {
+                setTimeout(function () { win.location.reload(); }, 150);
+                return { reloading: true, session: channel.id, previousLoadId: channel.loadId };
             }
         };
+
+        // ---------- Input simulation ----------
+        // Plays touch / drag steps as engine frames of a fixed delta, synchronously: the result does not depend on the
+        // browser's frame rate (a hidden tab or the editor's browser pane runs requestAnimationFrame about once a second).
+        // Input goes through the engine like a real player's: mouse events on the canvas (touch events if the page has
+        // no mouse), which Unity's Input and EventSystem read. The engine's own requestAnimationFrame loop goes on after.
+        function simulate(p) {
+            var a = getApp();
+            if (!a) throw new Error('The Luna engine has not started yet.');
+            var steps = p.steps;
+            if (!Array.isArray(steps) || !steps.length) throw new Error('steps is required: [{ x, y, frames }, { frames }, ...]');
+            var canvas = (a.graphicsDevice && a.graphicsDevice.canvas) || agent.gl.canvas();
+            if (!canvas) throw new Error('No canvas yet.');
+            var dt = Math.max(1 / 240, Math.min(0.1, +p.dt || 1 / 60));
+            var total = 0;
+            steps.forEach(function (s) { total += Math.max(0, Math.floor(+s.frames || 0)); });
+            if (total > 3600) throw new Error('At most 3600 frames (60 s at 60 fps) per call; split the steps.');
+            var rect = canvas.getBoundingClientRect(), useTouch = !a.mouse && !!a.touch && typeof win.Touch === 'function';
+            var pointer = null, ran = 0, errorsBefore = agent.console.errorCount(), totalBefore = agent.console.total(), t0 = realNow();
+
+            function fire(type, x, y) {
+                var cx = rect.left + x * rect.width, cy = rect.top + y * rect.height;
+                if (useTouch) {
+                    var t = new win.Touch({ identifier: 1, target: canvas, clientX: cx, clientY: cy, pageX: cx, pageY: cy });
+                    var live = type === 'touchend' ? [] : [t];
+                    canvas.dispatchEvent(new win.TouchEvent(type, { bubbles: true, cancelable: true, touches: live, targetTouches: live, changedTouches: [t] }));
+                } else {
+                    canvas.dispatchEvent(new win.MouseEvent(type, { bubbles: true, cancelable: true, view: win, button: 0,
+                        buttons: type === 'mouseup' ? 0 : 1, clientX: cx, clientY: cy }));
+                }
+            }
+            function press(x, y) { fire(useTouch ? 'touchstart' : 'mousedown', x, y); }
+            function move(x, y) { fire(useTouch ? 'touchmove' : 'mousemove', x, y); }
+            function release(x, y) { fire(useTouch ? 'touchend' : 'mouseup', x, y); }
+            function tick() {
+                var now = realNow();
+                a._time = now - dt * 1000;      // The engine's delta is now - _time: exactly dt.
+                a.tick(now);
+                ran++;
+            }
+
+            var raf = win.requestAnimationFrame;
+            win.requestAnimationFrame = function () { return 0; };     // The engine's pending frame request carries its loop on.
+            try {
+                steps.forEach(function (s) {
+                    var frames = Math.max(0, Math.floor(+s.frames || 0)), held = typeof s.x === 'number' && typeof s.y === 'number';
+                    var from = pointer ? { x: pointer.x, y: pointer.y } : null;
+                    for (var f = 0; f < frames; f++) {
+                        if (held && !pointer) {
+                            press(s.x, s.y);                 // Touch down here (a drag starts with a 1-frame step at its start).
+                            pointer = { x: s.x, y: s.y };
+                            from = { x: s.x, y: s.y };
+                        } else if (held) {
+                            var k = (f + 1) / frames;        // Already pressed: drag to (x, y) over the step.
+                            pointer = { x: from.x + (s.x - from.x) * k, y: from.y + (s.y - from.y) * k };
+                            move(pointer.x, pointer.y);
+                        } else if (pointer) {
+                            release(pointer.x, pointer.y);
+                            pointer = null;
+                        }
+                        tick();
+                    }
+                });
+                if (pointer && !p.keepPressed) { release(pointer.x, pointer.y); pointer = null; tick(); }
+            } finally {
+                win.requestAnimationFrame = raf;
+            }
+            var out = { frames: ran, seconds: Math.round(ran * dt * 1000) / 1000, frame: a.frame, realMs: Math.round(realNow() - t0),
+                input: useTouch ? 'touch' : 'mouse', newErrors: agent.console.errorCount() - errorsBefore,
+                newMessages: agent.console.total() - totalBefore };
+            if (pointer) out.stillPressed = { x: pointer.x, y: pointer.y };
+            if (out.newErrors) out.note = 'New errors while simulating: read them with luna_get_errors.';
+            return out;
+        }
 
         function hello() {
             var a = getApp();
             return { url: win.location.href, title: win.document && win.document.title, userAgent: win.navigator && win.navigator.userAgent,
-                engineReady: !!a, frame: a ? a.frame : 0 };
+                engineReady: !!a, frame: a ? a.frame : 0, loadId: channel.loadId, loadedAt: channel.loadedAt,
+                staticConstructorFailures: statics.failed.length };
         }
 
         function post(route, payload) {
@@ -1389,13 +1587,24 @@
             });
         }
 
+        // The long poll sends hello only every PollWaitMs: say at once when the engine starts (luna_reload waits for it).
+        function announceEngine() {
+            var waited = 0, timer = setInterval(function () {
+                waited += 250;
+                if (getApp() || waited > 120000) {
+                    clearInterval(timer);
+                    if (getApp()) post(RESULT_ROUTE, { hello: hello(), results: [] }).catch(function () { /* Next poll carries it. */ });
+                }
+            }, 250);
+        }
+
         agent.commands = commands;
-        agent.session = channel.id;
+        agent.session = function () { return channel.id; };
         // Only through the Dev Tools proxy (same origin as this script), which is where the channel lives.
         try {
             var here = win.location && win.location.origin;
             if (here && src.indexOf(here + '/__luna_devtools/') === 0 && typeof win.fetch === 'function')
-                setTimeout(pollLoop, 500);
+                setTimeout(function () { claimSession(function () { pollLoop(); announceEngine(); }); }, 200);
         } catch (e) {
             fail('agent channel', e);
         }

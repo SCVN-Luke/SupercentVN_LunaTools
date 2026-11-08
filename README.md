@@ -55,17 +55,22 @@ claude mcp add --transport http luna-devtools http://localhost:8100/mcp
 ```
 
 Pages opened through the Dev Tools connect as sessions (desktop tabs, phones on the LAN) by
-long-polling `/__luna_devtools/channel`; they reconnect after a Unity reload.
+long-polling `/__luna_devtools/channel`; they reconnect after a Unity reload. A tab keeps its session
+across reloads; tools default to the most recently loaded page.
 
-- Page: `luna_status`, `luna_get_stats`, `luna_get_errors` (deduplicated, C# stack), `luna_record_hot_paths`,
+- Page: `luna_status`, `luna_get_stats`, `luna_get_errors` (deduplicated, C# stack, and static
+  constructors that threw while Luna started, which Luna hides), `luna_record_hot_paths`,
   `luna_capture_frame`, `luna_find_objects`, `luna_get_object`, `luna_watch_field` / `luna_watch_hits`
-  (who assigns a field, with C# stack), `luna_screenshot`, `luna_control` (pause / step / speed /
-  restart), `luna_eval`.
-- Editor: `unity_build_develop` (waits, returns errors / warnings), `unity_build_report`,
-  `unity_luna_checks`, `unity_find_source` (C# name → file:line + code), `unity_open_source`.
+  (who assigns a field, with C# stack), `luna_screenshot`, `luna_reload` (fresh start, waits for the
+  engine), `luna_simulate` (touch / drag steps played frame by frame with a fixed delta, through the
+  engine's input; same result in a hidden tab), `luna_control` (pause / step / speed / restart), `luna_eval`.
+- Editor: `unity_compile` (imports changed scripts, C# errors with file:line), `unity_build_develop`
+  (starts the build and returns; poll `unity_build_report`, which keeps the result across a Unity
+  reload), `unity_luna_checks`, `unity_find_source` (C# name → file:line + code), `unity_open_source`.
 
 Reading tools use engine data and raw field values only (no C# method or getter runs), so Luna's
-runtime analysis is unchanged; `luna_control` and `luna_eval` can run game code and say so.
+runtime analysis is unchanged; `luna_control`, `luna_simulate` and `luna_eval` run game code and say so.
+Static initializers are wrapped to report their exceptions (called through unchanged, rethrown).
 The protocol, channel and JSON code (`Mcp/`, `DevToolsProxy`) use no Unity API and are tested outside
 the Editor.
 

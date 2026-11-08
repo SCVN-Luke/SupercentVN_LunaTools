@@ -12,9 +12,12 @@ namespace Supercent.Util.Editor
         public const string Instructions =
             "Debug a Luna playable (Unity Playworks) while it runs in Build Develop.\n" +
             "- Pages connect when the Build Develop page is opened through the Dev Tools (Luna Build Assistant). Start with luna_status: " +
-            "it lists connected pages (sessions); tools use the most recent page unless 'session' is given. unity_build_develop builds and opens one.\n" +
-            "- Errors: luna_get_errors gives deduplicated console errors with the C# method of each stack frame; unity_find_source turns a C# " +
-            "name into file:line to read the code.\n" +
+            "it lists connected pages (sessions; a tab keeps its session across reloads); tools use the most recently loaded page unless " +
+            "'session' is given. unity_build_develop starts a build (poll unity_build_report); unity_compile checks C# changes first.\n" +
+            "- Errors: luna_get_errors gives deduplicated console errors with the C# method of each stack frame, and static constructors that " +
+            "failed while Luna started (Luna hides those; the class keeps null statics). unity_find_source turns a C# name into file:line.\n" +
+            "- Reproduce: luna_reload for a fresh start, luna_simulate to play touch / drag steps frame by frame (works in hidden tabs), " +
+            "then luna_get_errors / luna_screenshot.\n" +
             "- Performance: luna_get_stats (frame time, draw calls, heap), luna_record_hot_paths (cost per script callback / coroutine and the " +
             "methods called inside, while the game is played), luna_capture_frame (draw calls of one frame).\n" +
             "- State: luna_find_objects / luna_get_object read the scene; luna_watch_field records who changes a field (with C# stack).\n" +
@@ -28,18 +31,22 @@ namespace Supercent.Util.Editor
             server.Register(new McpServer.Tool
             {
                 Name = "luna_status",
-                Description = "Connected Build Develop pages (sessions: url, title, browser, engine ready, frame) and the Editor state " +
-                              "(Dev Tools URL, last build). Call first.",
+                Description = "Connected Build Develop pages (sessions: url, title, browser, engine ready, frame, seconds since loaded, " +
+                              "failed static constructors, which one tools use by default) and the Editor state (Dev Tools URL, last build). Call first.",
                 ReadOnly = true,
                 InputSchema = McpServer.Schema(),
                 Run = args =>
                 {
+                    DateTime now = DateTime.UtcNow;
                     var data = new Dictionary<string, object>
                     {
                         { "sessions", channel.Sessions().Select(s => (object)new Dictionary<string, object>
                             {
-                                { "session", s.Id }, { "url", s.Url }, { "title", s.Title }, { "browser", s.UserAgent },
-                                { "engineReady", s.EngineReady }, { "frame", s.Frame }, { "secondsSinceSeen", Math.Round(s.SecondsSinceSeen, 1) },
+                                { "session", s.Id }, { "default", s.IsDefault }, { "url", s.Url }, { "title", s.Title }, { "browser", s.UserAgent },
+                                { "engineReady", s.EngineReady }, { "frame", s.Frame },
+                                { "loadedSecondsAgo", Math.Round((now - s.LoadedUtc).TotalSeconds, 1) },
+                                { "secondsSinceSeen", Math.Round(s.SecondsSinceSeen, 1) },
+                                { "staticConstructorFailures", s.StaticConstructorFailures },
                             }).ToList() },
                     };
                     if (editorStatus != null)
@@ -57,7 +64,8 @@ namespace Supercent.Util.Editor
 
             Page(server, channel, "luna_get_errors", "errors", 10000, true,
                 "Console errors and warnings of the page, deduplicated with counts, first/last frame, the stack and the C# method of each " +
-                "frame of the stack (from Luna's compiled scripts). Errors repeated every frame show a high count.",
+                "frame of the stack (from Luna's compiled scripts). Errors repeated every frame show a high count. staticConstructorFailures " +
+                "lists C# static constructors that threw while the page started: Luna hides them, and the class's static fields stay null.",
                 McpServer.Schema(new Dictionary<string, object>
                 {
                     { "session", session },
@@ -114,6 +122,59 @@ namespace Supercent.Util.Editor
                     { "path", McpServer.Prop("string", "Path from luna_find_objects, e.g. 'World/Player/Ore Stacker'") },
                     { "script", McpServer.Prop("string", "Only this MonoBehaviour (part of its class name)") },
                 }, "path"));
+
+            Page(server, channel, "luna_simulate", "simulate", 90000, false,
+                "Plays input steps as engine frames of a fixed delta, synchronously (same result in a hidden tab or a slow browser), through " +
+                "the engine's own input like a player's touch: Unity Input / EventSystem / joysticks see it. Coordinates are fractions of " +
+                "the canvas (0,0 top-left, 1,1 bottom-right). A step with x,y holds the finger there (the first one touches down, the next " +
+                "ones drag to their point over their frames); a step without x,y releases and waits. Example, drag a joystick up for 2 s " +
+                "then wait 1 s: [{x:0.5,y:0.7,frames:1},{x:0.5,y:0.5,frames:120},{frames:60}]. At most 3600 frames per call. Returns the " +
+                "frames run and how many new errors appeared. Runs game code like real play.",
+                McpServer.Schema(new Dictionary<string, object>
+                {
+                    { "session", session },
+                    { "steps", new Dictionary<string, object>
+                        {
+                            { "type", "array" },
+                            { "description", "Steps in order: {x, y, frames} = finger held at / dragged to (x, y); {frames} = released" },
+                            { "items", McpServer.Schema(new Dictionary<string, object>
+                                {
+                                    { "x", McpServer.Prop("number", "0-1 across the canvas") },
+                                    { "y", McpServer.Prop("number", "0-1 down the canvas") },
+                                    { "frames", McpServer.Prop("integer", "Engine frames for this step") },
+                                }, "frames") },
+                        } },
+                    { "dt", McpServer.Prop("number", "Seconds per frame", 1.0 / 60) },
+                    { "keepPressed", McpServer.Prop("boolean", "Leave the finger down after the last step (released by default)", false) },
+                }, "steps"));
+
+            server.Register(new McpServer.Tool
+            {
+                Name = "luna_reload",
+                Description = "Reloads the page (a fresh start of the playable, like F5) and waits until it is back with its engine running. The " +
+                              "session id stays the same. Use before reproducing a bug; static constructor failures of the new load then show in " +
+                              "luna_get_errors.",
+                ReadOnly = false,
+                InputSchema = McpServer.Schema(new Dictionary<string, object>
+                {
+                    { "session", session },
+                    { "waitSeconds", McpServer.Prop("number", "How long to wait for the page to come back", 60) },
+                }),
+                Run = args =>
+                {
+                    string id = channel.Resolve(MiniJson.Str(args, "session"));
+                    var answer = MiniJson.Obj(channel.Send(id, "reload", new Dictionary<string, object>(), 10000));
+                    DateTime started = DateTime.UtcNow;
+                    var info = channel.WaitForLoad(id, MiniJson.Str(answer, "previousLoadId"),
+                        (int)(Math.Max(5, Math.Min(180, MiniJson.Num(args, "waitSeconds", 60))) * 1000));
+                    return McpServer.ToolResult.Json(new Dictionary<string, object>
+                    {
+                        { "session", info.Id }, { "loadId", info.LoadId }, { "engineReady", info.EngineReady }, { "frame", info.Frame },
+                        { "secondsToReady", Math.Round((DateTime.UtcNow - started).TotalSeconds, 1) },
+                        { "staticConstructorFailures", info.StaticConstructorFailures },
+                    });
+                },
+            });
 
             Page(server, channel, "luna_control", "control", 10000, false,
                 "Changes the page: pause / resume / step one frame / speed (engine time scale x0.25-x8) / restart (reload). Pausing and speed " +

@@ -9,12 +9,14 @@ namespace Supercent.Util.Editor
     //   page  -> POST /__luna_devtools/channel?session=ID {hello, results}  (held until a command or the poll timeout)
     //   page  -> POST /__luna_devtools/result?session=ID  {results}         (answers right away)
     //   tools -> Send(session, method, params)  waits for that page's result.
-    // Every open page (desktop tab, phone) is a session; a page that stops polling is dropped.
+    // Every open tab (desktop, phone) is a session and keeps its id across reloads; each load has its own loadId.
+    // A page that stops polling is dropped. Tools default to the most recently loaded page.
     // No Unity API: runs on the proxy's connection threads and is tested outside the Editor.
     public sealed class DevToolsChannel
     {
         public const int PollWaitMs = 20000;
         const double SessionTimeoutSeconds = 45;
+        const double AliveSeconds = PollWaitMs / 1000.0 + 5;   // A live page polls at least this often.
 
         public sealed class SessionInfo
         {
@@ -26,6 +28,10 @@ namespace Supercent.Util.Editor
             public bool EngineReady;
             public int Frame;
             public DateTime ConnectedUtc;
+            public string LoadId;
+            public DateTime LoadedUtc;
+            public int StaticConstructorFailures;
+            public bool IsDefault;
         }
 
         sealed class Pending
@@ -45,6 +51,8 @@ namespace Supercent.Util.Editor
             public Dictionary<string, object> Hello = new Dictionary<string, object>();
             public DateTime LastSeenUtc;
             public DateTime ConnectedUtc;
+            public string LoadId;
+            public DateTime LoadedUtc;
             public readonly Queue<Pending> Queue = new Queue<Pending>();
             public readonly Dictionary<string, Pending> Waiting = new Dictionary<string, Pending>();
             public int PollGeneration;
@@ -60,7 +68,8 @@ namespace Supercent.Util.Editor
             {
                 Expire();
                 DateTime now = DateTime.UtcNow;
-                return sessions.Values.OrderByDescending(s => s.LastSeenUtc).Select(s => new SessionInfo
+                Session preferred = Default();
+                return sessions.Values.OrderByDescending(s => s.LoadedUtc).Select(s => new SessionInfo
                 {
                     Id = s.Id,
                     Url = MiniJson.Str(s.Hello, "url"),
@@ -70,8 +79,60 @@ namespace Supercent.Util.Editor
                     Frame = (int)MiniJson.Num(s.Hello, "frame", 0),
                     SecondsSinceSeen = (now - s.LastSeenUtc).TotalSeconds,
                     ConnectedUtc = s.ConnectedUtc,
+                    LoadId = s.LoadId,
+                    LoadedUtc = s.LoadedUtc,
+                    StaticConstructorFailures = (int)MiniJson.Num(s.Hello, "staticConstructorFailures", 0),
+                    IsDefault = s == preferred,
                 }).ToList();
             }
+        }
+
+        // The session a tool uses: the given one, or the most recently loaded live page. Throws when there is none.
+        public string Resolve(string sessionId)
+        {
+            lock (gate)
+            {
+                Expire();
+                return Find(sessionId).Id;
+            }
+        }
+
+        // Waits until the page of a session has loaded again (loadId differs from previousLoadId) and its engine runs.
+        public SessionInfo WaitForLoad(string sessionId, string previousLoadId, int timeoutMs)
+        {
+            DateTime until = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+            while (true)
+            {
+                SessionInfo info = Sessions().FirstOrDefault(s => s.Id == sessionId);
+                if (info != null && info.LoadId != previousLoadId && info.EngineReady)
+                    return info;
+                if (DateTime.UtcNow >= until)
+                    throw new TimeoutException(info == null || info.LoadId == previousLoadId
+                        ? $"The page did not come back within {timeoutMs / 1000}s (still loading, in a background tab, or closed)."
+                        : $"The page reloaded but its engine did not start within {timeoutMs / 1000}s. Check luna_get_errors.");
+                lock (gate)
+                    Monitor.Wait(gate, 250);
+            }
+        }
+
+        // Under the lock.
+        Session Default()
+        {
+            DateTime now = DateTime.UtcNow;
+            return sessions.Values.Where(s => (now - s.LastSeenUtc).TotalSeconds <= AliveSeconds).OrderByDescending(s => s.LoadedUtc).FirstOrDefault()
+                   ?? sessions.Values.OrderByDescending(s => s.LastSeenUtc).FirstOrDefault();
+        }
+
+        // Under the lock.
+        Session Find(string sessionId)
+        {
+            Session session = string.IsNullOrEmpty(sessionId) ? Default()
+                : sessions.TryGetValue(sessionId, out Session found) ? found : null;
+            if (session == null)
+                throw new InvalidOperationException(string.IsNullOrEmpty(sessionId)
+                    ? "No playable page is connected. Open the Build Develop page through the Dev Tools (Luna Build Assistant > Build Develop > Open with Dev Tools), then retry."
+                    : "No connected page with session " + sessionId + ". Call luna_status for the list.");
+            return session;
         }
 
         // Page side: records results and hello, then waits for commands. Returns the JSON reply.
@@ -111,11 +172,13 @@ namespace Supercent.Util.Editor
         {
             lock (gate)
             {
-                return Touch(sessionId, body) == null ? "{\"error\":\"missing session\"}" : "{\"ok\":true}";
+                Session session = Touch(sessionId, body);
+                Monitor.PulseAll(gate);         // A new hello (e.g. engine started) can end a WaitForLoad.
+                return session == null ? "{\"error\":\"missing session\"}" : "{\"ok\":true}";
             }
         }
 
-        // Tool side: runs a command in a page and waits for its result. session null = the most recently seen page.
+        // Tool side: runs a command in a page and waits for its result. session null = the most recently loaded page.
         public object Send(string sessionId, string method, Dictionary<string, object> parameters, int timeoutMs)
         {
             Pending p;
@@ -123,13 +186,7 @@ namespace Supercent.Util.Editor
             lock (gate)
             {
                 Expire();
-                session = string.IsNullOrEmpty(sessionId)
-                    ? sessions.Values.OrderByDescending(s => s.LastSeenUtc).FirstOrDefault()
-                    : sessions.TryGetValue(sessionId, out Session found) ? found : null;
-                if (session == null)
-                    throw new InvalidOperationException(string.IsNullOrEmpty(sessionId)
-                        ? "No playable page is connected. Open the Build Develop page through the Dev Tools (Luna Build Assistant > Build Develop > Open with Dev Tools), then retry."
-                        : "No connected page with session " + sessionId + ". Call luna_status for the list.");
+                session = Find(sessionId);
                 p = new Pending { Id = "c" + (++nextCommand), Method = method, Params = parameters ?? new Dictionary<string, object>() };
                 session.Queue.Enqueue(p);
                 session.Waiting[p.Id] = p;
@@ -186,7 +243,29 @@ namespace Supercent.Util.Editor
             if (message == null)
                 return session;
             if (MiniJson.Obj(message.TryGetValue("hello", out object hello) ? hello : null) is Dictionary<string, object> info)
+            {
                 session.Hello = info;
+                string loadId = MiniJson.Str(info, "loadId") ?? "";
+                if (session.LoadId != loadId)
+                {
+                    if (session.LoadId != null)
+                        foreach (Pending p in session.Waiting.Values.Where(p => p.Sent && !p.Done))
+                        {
+                            p.Error = "The page reloaded before answering.";    // Its old load can't answer any more.
+                            p.Done = true;
+                        }
+                    session.LoadId = loadId;
+                    // The page's own load time survives a proxy restart (Unity reload); clamp a phone's skewed clock.
+                    double loadedAt = MiniJson.Num(info, "loadedAt", 0);
+                    DateTime now = DateTime.UtcNow, at = now;
+                    if (loadedAt > 0)
+                    {
+                        try { at = DateTimeOffset.FromUnixTimeMilliseconds((long)loadedAt).UtcDateTime; }
+                        catch (ArgumentOutOfRangeException) { at = now; }
+                    }
+                    session.LoadedUtc = at > now ? now : at;
+                }
+            }
             if (message.TryGetValue("results", out object results) && results is List<object> list)
             {
                 foreach (object item in list)

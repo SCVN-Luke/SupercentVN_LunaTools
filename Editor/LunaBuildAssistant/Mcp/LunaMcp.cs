@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using UnityEditor;
+using UnityEditor.Compilation;
 using UnityEngine;
 
 namespace Supercent.Util.Editor
@@ -24,13 +25,97 @@ namespace Supercent.Util.Editor
         static Dictionary<string, object> editorState = new Dictionary<string, object>();
         static double stateAt;
 
+        // Kept in SessionState: a script change makes Unity reload this code in the middle of a build or a compile, and the
+        // agent asks for the result afterwards.
+        const string BuildStartedKey = "SupercentVN.LunaMcp.BuildStarted";
+        const string BuildResultKey = "SupercentVN.LunaMcp.BuildResult";
+        const string CompileResultKey = "SupercentVN.LunaMcp.CompileResult";
+        static bool buildWasRunning;
+        static readonly List<CompilerMessage> compileMessages = new List<CompilerMessage>();
+        static DateTime compileStartedUtc;
+
         static LunaMcp()
         {
             DevToolsMcpTools.Register(Server, Channel, () => editorState);
             RegisterEditorTools();
             EditorApplication.update += Update;
+            CompilationPipeline.compilationStarted += _ => { compileMessages.Clear(); compileStartedUtc = DateTime.UtcNow; };
+            CompilationPipeline.assemblyCompilationFinished += (_, messages) => compileMessages.AddRange(messages);
+            CompilationPipeline.compilationFinished += _ => SaveCompileResult();
             if (Enabled)
                 EditorApplication.delayCall += () => LunaDevTools.Start();
+        }
+
+        static void SaveCompileResult()
+        {
+            var errors = compileMessages.Where(m => m.type == CompilerMessageType.Error).ToList();
+            StoreJson(CompileResultKey, new Dictionary<string, object>
+            {
+                { "finishedAt", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") },
+                { "seconds", compileStartedUtc == default ? null : (object)Math.Round((DateTime.UtcNow - compileStartedUtc).TotalSeconds, 1) },
+                { "errorCount", errors.Count },
+                { "errors", errors.Take(40).Select(CompileIssue).ToList() },
+                { "warningCount", compileMessages.Count(m => m.type == CompilerMessageType.Warning) },
+            });
+        }
+
+        // SessionState does not keep non-ASCII text intact ("−" came back as "âˆ’"): store JSON with \u escapes. Non-ASCII
+        // characters only occur inside JSON strings, where the escape means the same.
+        static void StoreJson(string key, Dictionary<string, object> value)
+        {
+            string json = MiniJson.Write(value);
+            var sb = new System.Text.StringBuilder(json.Length);
+            foreach (char c in json)
+                if (c > 127)
+                    sb.Append("\\u").Append(((int)c).ToString("x4"));
+                else
+                    sb.Append(c);
+            SessionState.SetString(key, sb.ToString());
+        }
+
+        static object CompileIssue(CompilerMessage m) => new Dictionary<string, object>
+        {
+            { "file", m.file }, { "line", m.line > 0 ? (object)m.line : null }, { "message", m.message },
+        };
+
+        // Main thread: notices the end of an agent build and keeps its result across a domain reload.
+        static void TrackBuild()
+        {
+            bool running = LunaBuildAssistantWindow.AgentBuildRunning;
+            if (buildWasRunning && !running)
+            {
+                var summary = BuildSummary(LunaBuildAssistantWindow.AgentBuildReport, LunaBuildAssistantWindow.AgentBuildStatus);
+                summary["seconds"] = Math.Round(LunaBuildAssistantWindow.AgentBuildSeconds, 1);
+                summary["finishedAt"] = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+                StoreJson(BuildResultKey, summary);
+                SessionState.EraseString(BuildStartedKey);
+            }
+            buildWasRunning = running;
+        }
+
+        static Dictionary<string, object> BuildState()
+        {
+            string started = SessionState.GetString(BuildStartedKey, null), result = SessionState.GetString(BuildResultKey, null);
+            if (LunaBuildAssistantWindow.AgentBuildRunning || SafeIsBuilding())
+            {
+                var running = new Dictionary<string, object> { { "state", "running" }, { "startedAt", started } };
+                if (DateTime.TryParse(started, out DateTime at))
+                    running["seconds"] = Math.Round((DateTime.Now - at).TotalSeconds, 1);
+                return running;
+            }
+            if (!string.IsNullOrEmpty(started))
+                return new Dictionary<string, object>
+                {
+                    { "state", "lost" }, { "startedAt", started },
+                    { "note", "Unity reloaded its scripts during the build, so its result was lost: see diagnostics, or build again." },
+                };
+            if (!string.IsNullOrEmpty(result))
+            {
+                var finished = MiniJson.Obj(MiniJson.Parse(result)) ?? new Dictionary<string, object>();
+                finished["state"] = "finished";
+                return finished;
+            }
+            return new Dictionary<string, object> { { "state", "none" } };
         }
 
         public static bool Enabled
@@ -62,6 +147,7 @@ namespace Supercent.Util.Editor
                 }
                 action();
             }
+            TrackBuild();
             // Editor state for luna_status, read off the main thread by the MCP requests.
             if (EditorApplication.timeSinceStartup - stateAt > 1.0)
             {
@@ -120,50 +206,101 @@ namespace Supercent.Util.Editor
             Server.Register(new McpServer.Tool
             {
                 Name = "unity_build_develop",
-                Description = "Runs Clear Cache + Build Develop in the Unity Editor (Luna Build Assistant), waits for it, and returns the result: " +
-                              "errors (compile errors, unsupported C# / API, Playground sign-in) with file:line, Playworks warnings, duration. " +
-                              "With openPage the playable opens in the browser through the Dev Tools, so it connects for the luna_* tools. " +
-                              "Unity may ask the user to save a modified scene first.",
+                Description = "Starts Clear Cache + Build Develop in the Unity Editor (Luna Build Assistant) and returns right away: a build takes " +
+                              "minutes and Unity may reload its scripts during it, which would cut a long request. Poll unity_build_report " +
+                              "(build.state running / finished, with errors such as compile errors, unsupported C# / API, Playground sign-in " +
+                              "with file:line, Playworks warnings, duration). With openPage the playable opens through the Dev Tools and connects " +
+                              "for the luna_* tools. Changed scripts are imported first; if Unity is compiling it says so: call again after. " +
+                              "Unity may ask the user to save a modified scene.",
                 ReadOnly = false,
                 InputSchema = McpServer.Schema(new Dictionary<string, object>
                 {
                     { "openPage", McpServer.Prop("boolean", "Open the built page through the Dev Tools", true) },
-                    { "waitSeconds", McpServer.Prop("number", "How long to wait for the build (it keeps going after)", 300) },
+                    { "waitSeconds", McpServer.Prop("number", "Optionally wait up to this long (max 60) for the build before returning", 0) },
                 }),
                 Run = args =>
                 {
                     bool openPage = MiniJson.Bool(args, "openPage", true);
-                    string refused = OnMainThread(() => LunaBuildAssistantWindow.StartAgentBuild(openPage));
+                    string refused = OnMainThread(() =>
+                    {
+                        string why = LunaBuildAssistantWindow.StartAgentBuild(openPage);
+                        if (why == null)
+                        {
+                            SessionState.SetString(BuildStartedKey, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+                            SessionState.EraseString(BuildResultKey);
+                            buildWasRunning = true;
+                        }
+                        return why;
+                    });
                     if (refused != null)
                         return McpServer.ToolResult.Text(refused, true);
-                    DateTime until = DateTime.UtcNow.AddSeconds(Math.Max(10, Math.Min(900, MiniJson.Num(args, "waitSeconds", 300))));
+                    DateTime until = DateTime.UtcNow.AddSeconds(Math.Max(0, Math.Min(60, MiniJson.Num(args, "waitSeconds", 0))));
                     while (LunaBuildAssistantWindow.AgentBuildRunning && DateTime.UtcNow < until)
                         Thread.Sleep(500);
-                    if (LunaBuildAssistantWindow.AgentBuildRunning)
-                        return McpServer.ToolResult.Text("Still building; call unity_build_report later.");
-                    var summary = OnMainThread(() => BuildSummary(LunaBuildAssistantWindow.AgentBuildReport, LunaBuildAssistantWindow.AgentBuildStatus));
-                    summary["seconds"] = Math.Round(LunaBuildAssistantWindow.AgentBuildSeconds, 1);
-                    return McpServer.ToolResult.Json(summary);
+                    var state = OnMainThread(() => { TrackBuild(); return BuildState(); });
+                    if ((string)state["state"] == "running")
+                        state["hint"] = "Call unity_build_report every 15-30 s until build.state is finished.";
+                    return McpServer.ToolResult.Json(state);
                 },
             });
 
             Server.Register(new McpServer.Tool
             {
                 Name = "unity_build_report",
-                Description = "The Playworks plugin's Project Diagnostics of the last build (errors and warnings with C# file:line) and the result " +
-                              "of the last unity_build_develop.",
+                Description = "State of the build started by unity_build_develop (build.state: running / finished / lost / none, with errors, " +
+                              "warnings and duration when finished) and the Playworks plugin's Project Diagnostics of the last build " +
+                              "(errors and warnings with C# file:line).",
                 ReadOnly = true,
                 InputSchema = McpServer.Schema(),
-                Run = args => McpServer.ToolResult.Json(OnMainThread(() =>
+                Run = args => McpServer.ToolResult.Json(OnMainThread(() => new Dictionary<string, object>
                 {
-                    var data = new Dictionary<string, object>
-                    {
-                        { "diagnostics", BuildSummary(BuildDiagnostics.Collect("Last build", false, false, null), null) },
-                    };
-                    if (LunaBuildAssistantWindow.AgentBuildReport != null || LunaBuildAssistantWindow.AgentBuildStatus != null)
-                        data["lastAgentBuild"] = BuildSummary(LunaBuildAssistantWindow.AgentBuildReport, LunaBuildAssistantWindow.AgentBuildStatus);
-                    return data;
+                    { "build", BuildState() },
+                    { "diagnostics", BuildSummary(BuildDiagnostics.Collect("Last build", false, false, null), null) },
                 })),
+            });
+
+            Server.Register(new McpServer.Tool
+            {
+                Name = "unity_compile",
+                Description = "Imports changed scripts and reports C# compile errors (file:line), like switching to Unity does. If Unity starts " +
+                              "compiling, the answer is state=compiling: call again in 10-30 s (the MCP server restarts while Unity reloads " +
+                              "scripts; retry if the connection drops). Use after editing C#, before unity_build_develop.",
+                ReadOnly = false,
+                InputSchema = McpServer.Schema(),
+                Run = args =>
+                {
+                    bool compiling = OnMainThread(() =>
+                    {
+                        if (EditorApplication.isCompiling || EditorApplication.isUpdating)
+                            return true;
+                        AssetDatabase.Refresh();
+                        return EditorApplication.isCompiling || EditorApplication.isUpdating;
+                    });
+                    if (!compiling)
+                    {
+                        Thread.Sleep(1500);         // Compilation starts on a later editor tick.
+                        compiling = OnMainThread(() => EditorApplication.isCompiling || EditorApplication.isUpdating);
+                    }
+                    return McpServer.ToolResult.Json(OnMainThread(() =>
+                    {
+                        if (compiling)
+                            return new Dictionary<string, object>
+                            {
+                                { "state", "compiling" },
+                                { "hint", "Unity is compiling the changed scripts. Call unity_compile again in 10-30 s." },
+                            };
+                        string last = SessionState.GetString(CompileResultKey, null);
+                        var data = new Dictionary<string, object>
+                        {
+                            { "state", "idle" },
+                            { "hasCompileErrors", EditorUtility.scriptCompilationFailed },
+                            { "lastCompile", string.IsNullOrEmpty(last) ? null : MiniJson.Parse(last) },
+                        };
+                        if (EditorUtility.scriptCompilationFailed && string.IsNullOrEmpty(last))
+                            data["note"] = "Compile errors exist but were compiled before this Editor session: see Unity's Console.";
+                        return data;
+                    }));
+                },
             });
 
             Server.Register(new McpServer.Tool
