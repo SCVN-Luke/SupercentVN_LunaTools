@@ -71,13 +71,15 @@ namespace Supercent.Util.Editor
 
         public static Snapshot Latest => Load(Network, "latest");
         public static Snapshot Previous => Load(Network, "previous");
+        public static Snapshot LatestOf(string network) => Load(network, "latest");
+        public static Snapshot PreviousOf(string network) => Load(network, "previous");
 
-        // Runs the plugin's statistics step for the selected network and stores the result.
-        public static async System.Threading.Tasks.Task<Snapshot> Estimate()
+        // Runs the plugin's statistics step for a network (default: the selected one) and stores the result.
+        public static async System.Threading.Tasks.Task<Snapshot> Estimate(string network = null)
         {
             if (!HasBuildOutput)
                 throw new InvalidOperationException("No build output in LunaTemp: run Build Develop first.");
-            string network = Network;
+            network = string.IsNullOrEmpty(network) ? Network : network;
             string stats = Path.Combine(ProjectRoot, StatsFile);
             DateTime before = File.Exists(stats) ? File.GetLastWriteTimeUtc(stats) : default;
             string output = await LunaPluginBridge.EstimateSize(network);

@@ -107,6 +107,13 @@ across reloads; tools default to the most recently loaded page.
   Upload without its dialog: refused while building / compiling, with unsaved Luna scenes, when not
   signed in, or when a pre-upload check warns unless `force`; poll `unity_build_report` → `upload`).
   Agents upload only when the user asks. Playground sign-in stays in the Unity Playworks Plugin.
+- Size: `unity_build_size` (the Build size page for any network: total and change, size per kind, the
+  largest assets with their luna.json rule and source facts, biggest changes, duplicates; `estimate`
+  re-runs the plugin's breakdown over the last build), `unity_asset_size_try` (a texture or sound with
+  other settings, encoded with Luna's own tools without applying; `compare` tries Luna's usual
+  alternatives, `images` returns the encoded images to judge quality) and `unity_asset_settings_apply`
+  (writes an asset or folder rule into luna.json, like Apply in the window; only after the user agreed;
+  `reset` drops the path's own rule).
 
 Agent builds and uploads never save scenes: with a modified Luna scene they are refused, because
 saving would show a dialog that stops the Editor until someone answers it.

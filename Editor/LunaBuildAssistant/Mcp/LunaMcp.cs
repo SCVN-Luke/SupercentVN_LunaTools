@@ -13,7 +13,7 @@ namespace Supercent.Util.Editor
     // Page tools (DevToolsMcpTools) run in the Build Develop pages; the tools here run in the Editor on the main thread.
     // Started with Unity when enabled, so an agent's MCP configuration keeps working across domain reloads.
     [InitializeOnLoad]
-    public static class LunaMcp
+    public static partial class LunaMcp
     {
         const string EnabledPref = "SupercentVN.LunaBuildAssistant.Mcp";
         const int MainThreadTimeoutMs = 20000;
@@ -42,6 +42,7 @@ namespace Supercent.Util.Editor
             DevToolsMcpTools.Register(Server, Channel, EditorStatus);
             RegisterEditorTools();
             RegisterUploadTools();
+            RegisterSizeTools();
             Server.CheckProject = CheckProject;
             EditorApplication.update += Update;
             EditorApplication.quitting += LunaInstance.Remove;

@@ -188,6 +188,31 @@ namespace Supercent.Util.Editor
 
         public static int SoundBitrate(object values) => (int)GetPath(values, "bitrate");
 
+        // luna.json values a texture rule accepts (format: png8, png32, webp...; compression: quantSize, crush...).
+        public static string[] TextureFormatValues(Rule rule) => Options(rule.Draft.GetType(), "textureFormats", value: true);
+        public static string[] TextureCompressionValues(Rule rule) => Options(rule.Draft.GetType(), "textureCompressions", value: true);
+        public static string[] SoundChannelNames(Rule rule) => Options(rule.Draft.GetType(), "soundChannels");
+
+        // Puts sound settings into the draft; channels is a display name ("Mono"...). Returns why a value is refused, or null.
+        public static string SetSoundSettings(Rule rule, int? bitrate, string channels)
+        {
+            if (bitrate.HasValue)
+            {
+                if (bitrate.Value < 8 || bitrate.Value > 320)
+                    return "bitrate must be 8-320 kbps (the window offers " + string.Join(", ", Bitrates) + ").";
+                SetPath(rule.Draft, "bitrate", bitrate.Value);
+            }
+            if (!string.IsNullOrEmpty(channels))
+            {
+                string[] names = SoundChannelNames(rule);
+                int i = Array.FindIndex(names, n => string.Equals(n, channels, StringComparison.OrdinalIgnoreCase));
+                if (i < 0)
+                    return "channels must be one of: " + string.Join(", ", names) + ".";
+                SetPath(rule.Draft, "channels", i);
+            }
+            return null;
+        }
+
         // Display name of a texture setting value ("quantSize" -> "PNGQuant Small Size").
         public static string TextureLabel(object values, string table, string value)
         {
