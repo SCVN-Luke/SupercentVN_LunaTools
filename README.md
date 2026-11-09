@@ -113,7 +113,17 @@ across reloads; tools default to the most recently loaded page.
   other settings, encoded with Luna's own tools without applying; `compare` tries Luna's usual
   alternatives, `images` returns the encoded images to judge quality) and `unity_asset_settings_apply`
   (writes an asset or folder rule into luna.json, like Apply in the window; only after the user agreed;
-  `reset` drops the path's own rule).
+  `reset` drops the path's own rule; `asset: "default"` edits the kind's default rule; `keepCurrent` gives a path
+  its own rule with its current settings, so a later folder or default change leaves it as it is).
+- Project: `unity_console` (Editor Console, newest first, duplicates collapsed, optional stacks),
+  `unity_asset_references` (why an asset ships: who references it, with GameObject / component / property and
+  prefab overrides, and reference chains up to a Luna scene or force-include), `unity_luna_asset_lists`
+  (force-include / force-exclude / excluded scripts in luna.json; add and remove only after the user agreed).
+- Fonts (TextMeshPro, compiled when the project has it: `LUNA_TMP`): `unity_font_check` (each font asset texts use:
+  static / dynamic, atlas, point size, padding, characters, source font and whether it is force-excluded, materials,
+  characters texts show that the atlas lacks, texts whose material samples another atlas) and
+  `unity_font_atlas_rebuild` (rebuilds a static atlas in place with more characters at the largest point size that
+  fits, keeping the padding / point ratio and every reference; updates the materials' gradient scale).
 
 Agent builds and uploads never save scenes: with a modified Luna scene they are refused, because
 saving would show a dialog that stops the Editor until someone answers it.

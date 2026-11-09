@@ -1,7 +1,9 @@
 {
     "name": "SupercentVN.LunaTools.Editor",
     "rootNamespace": "Supercent.Util.Editor",
-    "references": [],
+    "references": [
+        "Unity.TextMeshPro"
+    ],
     "includePlatforms": [
         "Editor"
     ],
@@ -11,6 +13,17 @@
     "precompiledReferences": [],
     "autoReferenced": false,
     "defineConstraints": [],
-    "versionDefines": [],
+    "versionDefines": [
+        {
+            "name": "com.unity.textmeshpro",
+            "expression": "1.0.0",
+            "define": "LUNA_TMP"
+        },
+        {
+            "name": "com.unity.ugui",
+            "expression": "2.0.0",
+            "define": "LUNA_TMP"
+        }
+    ],
     "noEngineReferences": false
 }

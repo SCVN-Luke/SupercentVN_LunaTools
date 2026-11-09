@@ -91,15 +91,18 @@ namespace Supercent.Util.Editor
             Server.Register(new McpServer.Tool
             {
                 Name = "unity_asset_settings_apply",
-                Description = "Writes Luna export settings for an asset or a folder into luna.json, like Apply in the Build Assistant's Build size " +
-                              "and Assets pages (the asset gets its own rule, starting from the rule it has now). Only after the user agreed to the " +
-                              "exact change. reset=true removes the path's own rule (back to the folder or default rule). Takes effect in the next " +
-                              "build: unity_build_develop, then unity_build_size to measure. Changes luna.json, which the user commits or reverts.",
+                Description = "Writes Luna export settings for an asset, a folder or the kind's default rule into luna.json, like Apply in the " +
+                              "Build Assistant's Build size and Assets pages (an asset or folder gets its own rule, starting from the rule it has " +
+                              "now). Only after the user agreed to the exact change. keepCurrent=true gives the path its own rule with the settings " +
+                              "it has now (so a later folder / default change leaves it as it is); reset=true removes the path's own rule (back to " +
+                              "the folder or default rule). Takes effect in the next build: unity_build_develop, then unity_build_size to measure. " +
+                              "Changes luna.json, which the user commits or reverts.",
                 ReadOnly = false,
                 InputSchema = McpServer.Schema(SettingProps(new Dictionary<string, object>
                 {
-                    { "asset", McpServer.Prop("string", "Asset path, or a folder path (then 'kind' is required)") },
+                    { "asset", McpServer.Prop("string", "Asset path, a folder path, or \"default\" for the kind's default rule (folder and default need 'kind')") },
                     { "kind", McpServer.Prop("string", "Rule kind: texture or sound (default: from the asset)", null, new[] { "texture", "sound" }) },
+                    { "keepCurrent", McpServer.Prop("boolean", "Give the path its own rule with its current settings (no other change)", false) },
                     { "reset", McpServer.Prop("boolean", "Remove this path's own rule instead", false) },
                 }), "asset"),
                 Run = args => McpServer.ToolResult.Json(OnMainThread(() => ApplySettings(args))),
@@ -471,20 +474,34 @@ namespace Supercent.Util.Editor
             if (LunaBuildAssistantWindow.AgentBuildRunning || SafeIsBuilding() || !string.IsNullOrEmpty(SessionState.GetString(UploadKey, null)))
                 throw new InvalidOperationException("A build or an upload is running: change luna.json after it finished.");
             string path = MiniJson.Str(args, "asset")?.Trim().TrimEnd('/');
-            if (string.IsNullOrEmpty(path) || !path.StartsWith("Assets", StringComparison.Ordinal))
-                throw new InvalidOperationException("asset must be a project path starting with Assets/.");
-            bool folder = AssetDatabase.IsValidFolder(path);
-            if (!folder && string.IsNullOrEmpty(AssetDatabase.AssetPathToGUID(path)))
-                throw new InvalidOperationException("No asset or folder at " + path);
-            LunaAssetRules.Kind kind = RuleKind(MiniJson.Str(args, "kind"), folder ? null : path);
+            bool isDefault = string.Equals(path, "default", StringComparison.OrdinalIgnoreCase) || path == "@default";
+            bool folder = !isDefault && AssetDatabase.IsValidFolder(path ?? string.Empty);
+            if (!isDefault)
+            {
+                if (string.IsNullOrEmpty(path) || !path.StartsWith("Assets", StringComparison.Ordinal))
+                    throw new InvalidOperationException("asset must be a project path starting with Assets/, or \"default\".");
+                if (!folder && string.IsNullOrEmpty(AssetDatabase.AssetPathToGUID(path)))
+                    throw new InvalidOperationException("No asset or folder at " + path);
+            }
+            LunaAssetRules.Kind kind = RuleKind(MiniJson.Str(args, "kind"), folder || isDefault ? null : path);
+            if (folder && LunaAssetRules.OverrideKeys(kind).Contains(path + "/"))
+                path += "/";                            // Folder rules made in the plugin end with a slash: edit that rule, not a second one.
 
-            LunaAssetRules.Rule rule = LunaAssetRules.Get(kind, path);
+            LunaAssetRules.Rule rule = isDefault ? LunaAssetRules.GetDefault(kind) : LunaAssetRules.Get(kind, path);
             string before = LunaAssetRules.Summary(kind, rule.Values), beforeRule = LunaAssetRules.Describe(rule);
+            if (isDefault)
+                path = kind.ToString().ToLowerInvariant() + " default rule";
             if (MiniJson.Bool(args, "reset", false))
             {
-                if (!rule.IsOwn)
-                    throw new InvalidOperationException(path + " has no rule of its own (" + beforeRule + ").");
+                if (isDefault || !rule.IsOwn)
+                    throw new InvalidOperationException(path + " has no rule of its own to remove (" + beforeRule + ").");
                 LunaAssetRules.Reset(rule);
+            }
+            else if (MiniJson.Bool(args, "keepCurrent", false))
+            {
+                if (isDefault || rule.IsOwn)
+                    return new Dictionary<string, object> { { "asset", path }, { "changed", false }, { "settings", before }, { "rule", beforeRule } };
+                LunaAssetRules.AddOverride(kind, path);
             }
             else
             {
@@ -511,7 +528,7 @@ namespace Supercent.Util.Editor
                 LunaAssetRules.Apply(rule);
             }
 
-            LunaAssetRules.Rule after = LunaAssetRules.Get(kind, path);
+            LunaAssetRules.Rule after = isDefault ? LunaAssetRules.GetDefault(kind) : LunaAssetRules.Get(kind, path);
             Debug.Log($"[LunaBuildAssistant] Luna settings of {path} changed by an agent: {before} -> {LunaAssetRules.Summary(kind, after.Values)}.");
             return new Dictionary<string, object>
             {
@@ -535,7 +552,7 @@ namespace Supercent.Util.Editor
                 }
             }
             if (assetPath == null)
-                throw new InvalidOperationException("kind (texture or sound) is required for a folder.");
+                throw new InvalidOperationException("kind (texture or sound) is required for a folder or the default rule.");
             switch (AssetImporter.GetAtPath(assetPath))
             {
                 case TextureImporter _: return LunaAssetRules.Kind.Texture;

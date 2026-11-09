@@ -43,6 +43,8 @@ namespace Supercent.Util.Editor
             RegisterEditorTools();
             RegisterUploadTools();
             RegisterSizeTools();
+            RegisterProjectTools();
+            RegisterFontTools();
             Server.CheckProject = CheckProject;
             EditorApplication.update += Update;
             EditorApplication.quitting += LunaInstance.Remove;
@@ -51,6 +53,9 @@ namespace Supercent.Util.Editor
             CompilationPipeline.assemblyCompilationFinished += (_, messages) => compileMessages.AddRange(messages);
             CompilationPipeline.compilationFinished += _ => SaveCompileResult();
         }
+
+        // TextMeshPro font tools (LunaMcpFonts.cs), compiled only when the project has TextMeshPro (LUNA_TMP).
+        static partial void RegisterFontTools();
 
         // Started with Unity (first editor tick after each domain reload), before any Build Develop: the MCP answers as
         // soon as the Editor has loaded. Not delayCall: a package that assigns delayCall instead of adding to it drops it.

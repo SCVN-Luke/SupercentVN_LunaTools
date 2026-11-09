@@ -23,7 +23,10 @@ namespace Supercent.Util.Editor
             "- State: luna_find_objects / luna_get_object read the scene; luna_watch_field records who changes a field (with C# stack).\n" +
             "- Size: unity_build_size lists what makes the playable heavy (per kind, largest assets with their Luna settings, duplicates); " +
             "unity_asset_size_try estimates other texture / sound settings (images to judge quality); unity_asset_settings_apply writes " +
-            "luna.json only after the user agreed to the change.\n" +
+            "luna.json only after the user agreed to the change (also a folder or the default rule; keepCurrent pins a path's settings).\n" +
+            "- Project: unity_console reads the Editor Console; unity_asset_references says why an asset ships (who references it, " +
+            "chains up to a Luna scene); unity_luna_asset_lists reads / changes force-include and force-exclude. Fonts: unity_font_check " +
+            "(fonts, materials, characters texts lack), unity_font_atlas_rebuild (static atlas with more characters, after the user agreed).\n" +
             "- Upload: only when the user asks. unity_upload_targets lists applications / concepts and the pre-upload warnings; confirm the " +
             "application and concept with the user, then unity_build_upload and poll unity_build_report (upload.state).\n" +
             "- Tools marked as changing the page (luna_control, luna_eval) can run game code: Luna's runtime analysis then counts that code as " +
