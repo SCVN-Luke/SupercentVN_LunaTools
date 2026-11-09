@@ -1662,10 +1662,10 @@
             '.inner{padding:2px 0 4px 10px;font-size:10.5px;opacity:.8}',
             // Name cells: the class part shrinks with an ellipsis first, so the method name stays readable.
             'td.nmc{max-width:none;overflow:visible}',
-            '.nm{display:flex;min-width:0;max-width:var(--nmw,170px)}',
+            '.nm{display:flex;min-width:0;max-width:var(--nmw,160px)}',
             '.nm .ns{flex:0 1000 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
             '.nm .me{flex:0 1 auto;min-width:0;max-width:calc(100% - 3em);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-            'table.wide{--nmw:230px}'
+            'table.wide{--nmw:190px}'
         ].join('\n');
 
         var where = inPlayable ? 'playable.' : 'shell.';
