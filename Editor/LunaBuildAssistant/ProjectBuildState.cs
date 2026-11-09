@@ -63,13 +63,17 @@ namespace Supercent.Util.Editor
             foreach (string file in files)
             {
                 string relative = file.Substring(ProjectRoot.Length + 1).Replace('\\', '/');
-                if (Path.GetFileName(relative).StartsWith(".", StringComparison.Ordinal) || Ignored.Contains(relative))
+                if (Path.GetFileName(relative).StartsWith(".", StringComparison.Ordinal) || Ignored.Contains(relative) || IsEditorOnly(relative))
                     continue;
                 if (File.GetLastWriteTimeUtc(file) > since.Value)
                     changes.Add(relative);
             }
             return changes;
         }
+
+        // Files in Editor folders never reach the playable (Luna excludes **/Editor/), e.g. this tool's own updates.
+        static bool IsEditorOnly(string relative) =>
+            relative.StartsWith("Assets/", StringComparison.Ordinal) && relative.IndexOf("/Editor/", StringComparison.OrdinalIgnoreCase) >= 0;
 
         // Current branch from .git/HEAD (also handles worktrees and submodules, where .git is a file); null if detached.
         public static string CurrentBranch()

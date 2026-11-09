@@ -34,17 +34,84 @@ namespace Supercent.Util.Editor
         static readonly List<CompilerMessage> compileMessages = new List<CompilerMessage>();
         static DateTime compileStartedUtc;
 
+        static readonly string projectPath = LunaMachine.Normalize(Directory.GetParent(Application.dataPath).FullName);
+        static readonly int pid = System.Diagnostics.Process.GetCurrentProcess().Id;
+
         static LunaMcp()
         {
-            DevToolsMcpTools.Register(Server, Channel, () => editorState);
+            DevToolsMcpTools.Register(Server, Channel, EditorStatus);
             RegisterEditorTools();
+            RegisterUploadTools();
+            Server.CheckProject = CheckProject;
             EditorApplication.update += Update;
+            EditorApplication.quitting += LunaInstance.Remove;
+            AssemblyReloadEvents.beforeAssemblyReload += () => LunaInstance.Write(projectPath, pid, null, "reloading");
             CompilationPipeline.compilationStarted += _ => { compileMessages.Clear(); compileStartedUtc = DateTime.UtcNow; };
             CompilationPipeline.assemblyCompilationFinished += (_, messages) => compileMessages.AddRange(messages);
             CompilationPipeline.compilationFinished += _ => SaveCompileResult();
-            if (Enabled)
-                EditorApplication.delayCall += () => LunaDevTools.Start();
         }
+
+        // Started with Unity (first editor tick after each domain reload), before any Build Develop: the MCP answers as
+        // soon as the Editor has loaded. Not delayCall: a package that assigns delayCall instead of adding to it drops it.
+        static bool started;
+
+        static void StartOnce()
+        {
+            if (started)
+                return;
+            started = true;
+            if (Enabled)
+                LunaDevTools.Start();
+            LunaInstance.Publish(Server, BrokerSource());
+        }
+
+        // luna_status: the Editor state, plus whether the develop server serves this project (asked when called).
+        static Dictionary<string, object> EditorStatus()
+        {
+            var state = new Dictionary<string, object>(editorState);
+            state["developServerProblem"] = LunaDevTools.UpstreamProblem;
+            return state;
+        }
+
+        // The project an agent meant (the broker always says): refuse when this Editor has another project open.
+        static string CheckProject(string wanted)
+        {
+            if (string.IsNullOrWhiteSpace(wanted))
+                return null;
+            string name = Path.GetFileName(projectPath);
+            wanted = wanted.Trim();
+            bool path = wanted.IndexOf('/') >= 0 || wanted.IndexOf('\\') >= 0;
+            if (!path)
+                return string.Equals(wanted, name, StringComparison.OrdinalIgnoreCase) ? null : Wrong(wanted, name);
+            string full = LunaMachine.Normalize(wanted);
+            bool same = string.Equals(full, projectPath, StringComparison.OrdinalIgnoreCase)
+                        || projectPath.StartsWith(full + "/", StringComparison.OrdinalIgnoreCase);   // The repository holding it.
+            return same ? null : Wrong(wanted, projectPath);
+        }
+
+        static string Wrong(string wanted, string open) =>
+            $"This Unity Editor has '{open}' open, not '{wanted}'. Call luna_instances to see the open projects.";
+
+        static string BrokerSource([System.Runtime.CompilerServices.CallerFilePath] string self = "")
+        {
+            try
+            {
+                string path = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(self)) ?? string.Empty, "Broker~", "luna-mcp.mjs");
+                if (File.Exists(path))
+                    return path;
+            }
+            catch (Exception)
+            {
+                // Fall back to the asset database below.
+            }
+            string script = AssetDatabase.FindAssets("LunaMcp t:MonoScript").Select(AssetDatabase.GUIDToAssetPath)
+                .FirstOrDefault(p => p.EndsWith("/Mcp/LunaMcp.cs", StringComparison.Ordinal));
+            string broker = script == null ? null : Path.Combine(Path.GetDirectoryName(Path.GetFullPath(script)) ?? string.Empty, "Broker~", "luna-mcp.mjs");
+            return broker != null && File.Exists(broker) ? broker : null;
+        }
+
+        public static string BrokerCommand(string agentName = "luna-devtools") =>
+            $"claude mcp add -s user {agentName} -- node \"{LunaMachine.BrokerFile}\"";
 
         static void SaveCompileResult()
         {
@@ -106,7 +173,7 @@ namespace Supercent.Util.Editor
 
         public static bool Enabled
         {
-            get => EditorPrefs.GetBool(EnabledPref, false);
+            get => EditorPrefs.GetBool(EnabledPref, true);
             set
             {
                 EditorPrefs.SetBool(EnabledPref, value);
@@ -117,11 +184,13 @@ namespace Supercent.Util.Editor
         }
 
         public static string Url => LunaDevTools.IsRunning && Enabled ? LunaDevTools.LocalUrl + "mcp" : null;
-        public static string ClaudeCommand => "claude mcp add --transport http luna-devtools " + (Url ?? "http://localhost:" + LunaDevTools.FirstPort + "/mcp");
+        // One registration per machine: the broker finds the Editor of the agent's project among the open ones.
+        public static string ClaudeCommand => BrokerCommand();
         public static int ConnectedPages => Channel.Sessions().Count;
 
         static void Update()
         {
+            StartOnce();
             while (true)
             {
                 Action action;
@@ -134,22 +203,33 @@ namespace Supercent.Util.Editor
                 action();
             }
             TrackBuild();
+            TrackUpload();
             // Editor state for luna_status, read off the main thread by the MCP requests.
             if (EditorApplication.timeSinceStartup - stateAt > 1.0)
             {
                 stateAt = EditorApplication.timeSinceStartup;
                 DateTime? last = ProjectBuildState.LastPrivateBuildUtc;
+                bool building = LunaBuildAssistantWindow.AgentBuildRunning || SafeIsBuilding();
                 editorState = new Dictionary<string, object>
                 {
-                    { "project", Path.GetFileName(Directory.GetParent(Application.dataPath).FullName) },
+                    { "project", Path.GetFileName(projectPath) },
+                    { "projectPath", projectPath },
                     { "unity", Application.unityVersion },
                     { "playworksPlugin", LunaPluginBridge.Version },
+                    { "mcpUrl", Url },
                     { "devToolsUrl", LunaDevTools.LocalUrl },
                     { "phoneUrl", LunaDevTools.LanUrl },
                     { "developServerPort", LunaDevTools.UpstreamPort },
-                    { "building", LunaBuildAssistantWindow.AgentBuildRunning || SafeIsBuilding() },
+                    { "portNote", LunaDevTools.PortNote },
+                    { "building", building },
+                    { "uploading", !string.IsNullOrEmpty(SessionState.GetString(UploadKey, null)) },
                     { "lastBuildDevelop", last.HasValue ? last.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") : null },
                 };
+                string state = !Enabled ? "off" : !LunaDevTools.IsRunning ? "error"
+                    : EditorApplication.isCompiling || EditorApplication.isUpdating ? "compiling"
+                    : (bool)editorState["uploading"] ? "uploading" : building ? "building" : "ready";
+                LunaInstance.Heartbeat(projectPath, pid, Url, state, LunaDevTools.LocalUrl, LunaDevTools.UpstreamPort, Application.unityVersion,
+                                       LunaDevTools.LastError ?? LunaDevTools.PortNote);
             }
         }
 
@@ -234,13 +314,15 @@ namespace Supercent.Util.Editor
             {
                 Name = "unity_build_report",
                 Description = "State of the build started by unity_build_develop (build.state: running / finished / lost / none, with errors, " +
-                              "warnings and duration when finished) and the Playworks plugin's Project Diagnostics of the last build " +
+                              "warnings and duration when finished), of the upload started by unity_build_upload (upload.state, same shape), " +
+                              "and the Playworks plugin's Project Diagnostics of the last build " +
                               "(errors and warnings with C# file:line).",
                 ReadOnly = true,
                 InputSchema = McpServer.Schema(),
                 Run = args => McpServer.ToolResult.Json(OnMainThread(() => new Dictionary<string, object>
                 {
                     { "build", BuildState() },
+                    { "upload", UploadState() },
                     { "diagnostics", BuildSummary(BuildDiagnostics.Collect("Last build", false, false, null), null) },
                 })),
             });
@@ -343,6 +425,276 @@ namespace Supercent.Util.Editor
                     return new Dictionary<string, object> { { "opened", ProjectCode.OpenSource(type, member) } };
                 })),
             });
+        }
+
+        // ---- Build & upload (Playground Creative Library) ----
+
+        const string UploadKey = "SupercentVN.LunaMcp.Upload";                  // The running upload, as JSON.
+        const string UploadResultKey = "SupercentVN.LunaMcp.UploadResult";
+        const double UploadStartTimeout = 10.0;     // An upload that never shows as building: read its result anyway.
+        const int PlaygroundTimeoutMs = 45000;
+        const int ChecksTimeoutMs = 90000;          // Stripped-code and Luna checks read every project assembly.
+
+        static void RegisterUploadTools()
+        {
+            Server.Register(new McpServer.Tool
+            {
+                Name = "unity_upload_targets",
+                Description = "Before unity_build_upload: Playground sign-in, the applications, the concepts of one application (newest " +
+                              "first), the concept the Build Assistant would pick for this branch, a suggested name for a new concept, and the " +
+                              "checks that would warn before uploading (changes since the last Build Develop, stripped code still called, Luna " +
+                              "checks, unsaved Luna scenes). Reads Playground; changes nothing.",
+                ReadOnly = true,
+                InputSchema = McpServer.Schema(new Dictionary<string, object>
+                {
+                    { "applicationId", McpServer.Prop("integer", "Application to list concepts of (default: the last one used in this project)") },
+                }),
+                Run = args => McpServer.ToolResult.Json(UploadTargets((int)MiniJson.Num(args, "applicationId", 0))),
+            });
+
+            Server.Register(new McpServer.Tool
+            {
+                Name = "unity_build_upload",
+                Description = "Build & upload to the Playground Creative Library, like the Build Assistant's Build & Upload button (uploads the " +
+                              "playable for others to see: only when the user asked for an upload, with the application and concept they " +
+                              "confirmed). Returns once started; poll unity_build_report (upload.state running / finished, with errors). " +
+                              "Refused while a build runs, while Unity compiles, with unsaved Luna scenes, when not signed in, and when a " +
+                              "pre-upload check warns (changes since the last Build Develop, stripped code still called, Luna checks) unless " +
+                              "force is true. Uploads the project as it is on disk, including uncommitted changes.",
+                ReadOnly = false,
+                InputSchema = McpServer.Schema(new Dictionary<string, object>
+                {
+                    { "applicationId", McpServer.Prop("integer", "Playground application id (unity_upload_targets)") },
+                    { "concept", McpServer.Prop("string", "Existing concept name (a new version of it), or the name of a new concept with createConcept") },
+                    { "createConcept", McpServer.Prop("boolean", "Create the concept when no concept has this name (otherwise refused)", false) },
+                    { "force", McpServer.Prop("boolean", "Upload even when a pre-upload check warns (only after the user accepted the warnings)", false) },
+                }, "applicationId", "concept"),
+                Run = args => Upload((int)MiniJson.Num(args, "applicationId", 0), MiniJson.Str(args, "concept"),
+                                     MiniJson.Bool(args, "createConcept", false), MiniJson.Bool(args, "force", false)),
+            });
+        }
+
+        static Dictionary<string, object> UploadTargets(int applicationId)
+        {
+            var data = OnMainThread(() =>
+            {
+                if (!LunaPluginBridge.IsAvailable)
+                    throw new InvalidOperationException("The Unity Playworks Plugin cannot be used: " + LunaPluginBridge.BlockedReason);
+                return new Dictionary<string, object> { { "signedIn", LunaPluginBridge.IsSignedIn } };
+            });
+            if (!(bool)data["signedIn"])
+            {
+                data["hint"] = "Sign in to Playground once in the Unity Playworks Plugin (Tools/Unity Playworks Plugin); agents cannot sign in.";
+                return data;
+            }
+            LunaPluginBridge.App[] apps = LoadApps();
+            int appId = applicationId != 0 ? applicationId : OnMainThread(DefaultApplicationId);
+            LunaPluginBridge.App app = apps.FirstOrDefault(a => a.Id == appId);
+            if (app.Id == 0 && apps.Length > 0)
+                app = apps[0];
+            data["applications"] = apps.Select(a => (object)new Dictionary<string, object> { { "id", a.Id }, { "name", a.Name } }).ToList();
+            if (app.Id == 0)
+                return data;
+            LunaPluginBridge.Concept[] concepts = LoadConcepts(app.Id);
+            return OnMainThread(() =>
+            {
+                string branch = ProjectBuildState.CurrentBranch();
+                var names = concepts.Select(c => c.Name).ToList();
+                data["application"] = new Dictionary<string, object> { { "id", app.Id }, { "name", app.Name } };
+                data["concepts"] = concepts.Take(40).Select(c => (object)new Dictionary<string, object> { { "id", c.Id }, { "name", c.Name } }).ToList();
+                data["conceptCount"] = concepts.Length;
+                data["branch"] = branch;
+                data["defaultConcept"] = ConceptNaming.DefaultConcept(names, branch);
+                data["suggestedNewConcept"] = ConceptNaming.Suggest(names, app.Name, branch, DateTime.Now, string.Empty);
+                DateTime? last = ProjectBuildState.LastPrivateBuildUtc;
+                data["lastBuildDevelop"] = last.HasValue ? last.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") : null;
+                data["warnings"] = LunaUpload.Warnings(NewChecks());
+                data["unsavedLunaScenes"] = LunaUpload.UnsavedLunaScenes();
+                return data;
+            }, ChecksTimeoutMs);
+        }
+
+        static McpServer.ToolResult Upload(int applicationId, string concept, bool createConcept, bool force)
+        {
+            if (string.IsNullOrWhiteSpace(concept))
+                return McpServer.ToolResult.Text("concept is required (see unity_upload_targets).", true);
+            string refused = OnMainThread(() =>
+            {
+                if (!LunaPluginBridge.IsAvailable)
+                    return "The Unity Playworks Plugin cannot be used: " + LunaPluginBridge.BlockedReason;
+                if (!LunaPluginBridge.IsSignedIn)
+                    return "Not signed in to Playground: the user signs in once in the Unity Playworks Plugin (Tools/Unity Playworks Plugin).";
+                if (LunaBuildAssistantWindow.AgentBuildRunning || SafeIsBuilding() || !string.IsNullOrEmpty(SessionState.GetString(UploadKey, null)))
+                    return "A build or an upload is already running: poll unity_build_report.";
+                return null;
+            });
+            if (refused != null)
+                return McpServer.ToolResult.Text(refused, true);
+
+            LunaPluginBridge.App app = LoadApps().FirstOrDefault(a => a.Id == applicationId);
+            if (app.Id == 0)
+                return McpServer.ToolResult.Text($"No Playground application with id {applicationId} (see unity_upload_targets).", true);
+            LunaPluginBridge.Concept[] concepts = LoadConcepts(app.Id);
+            LunaPluginBridge.Concept existing = concepts.FirstOrDefault(c => string.Equals(c.Name, concept.Trim(), StringComparison.OrdinalIgnoreCase));
+            bool isNew = existing.Id == 0;
+            string name = isNew ? ConceptNaming.Sanitize(concept) : existing.Name;
+            if (isNew && !createConcept)
+                return McpServer.ToolResult.Text($"{app.Name} has no concept '{concept}'. Pass createConcept=true to create it, or use one of: " +
+                                                 string.Join(", ", concepts.Take(15).Select(c => c.Name)), true);
+            if (name.Length == 0)
+                return McpServer.ToolResult.Text("The concept name is empty once cleaned.", true);
+
+            var started = OnMainThread(() =>
+            {
+                AssetDatabase.Refresh();
+                if (EditorApplication.isCompiling || EditorApplication.isUpdating)
+                    return Refusal("Unity is importing / compiling changed scripts. Call again in a few seconds.");
+                if (EditorUtility.scriptCompilationFailed)
+                    return Refusal("The project has C# compile errors (unity_compile).");
+                List<string> unsaved = LunaUpload.UnsavedLunaScenes();
+                if (unsaved.Count > 0)
+                    return Refusal("Unsaved Luna scene(s): " + string.Join(", ", unsaved) + ". The user saves them in Unity first (agents never save scenes).");
+                List<string> warnings = LunaUpload.Warnings(NewChecks());
+                if (warnings.Count > 0 && !force)
+                {
+                    var r = Refusal("Pre-upload checks warn. Tell the user; upload with force=true only if they accept.");
+                    r["warnings"] = warnings;
+                    return r;
+                }
+                var upload = new Dictionary<string, object>
+                {
+                    { "application", app.Name }, { "applicationId", app.Id }, { "concept", name }, { "newConcept", isNew },
+                    { "startedAt", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") }, { "startedAtEditor", EditorApplication.timeSinceStartup },
+                    { "reportBefore", BuildDiagnostics.CurrentReportId() }, { "sawBuilding", false },
+                };
+                SessionState.SetString(UploadKey, MiniJson.Write(upload));
+                SessionState.EraseString(UploadResultKey);
+                string cancelled;
+                try
+                {
+                    cancelled = LunaUpload.Start(app.Id, name, isNew ? -1 : existing.Id);
+                }
+                catch (Exception)
+                {
+                    SessionState.EraseString(UploadKey);
+                    throw;
+                }
+                if (cancelled != null)
+                {
+                    SessionState.EraseString(UploadKey);
+                    return Refusal(cancelled);
+                }
+                Debug.Log($"[LunaBuildAssistant] Build & upload started by an agent: {app.Name} / {name}{(isNew ? " (new concept)" : string.Empty)}.");
+                var state = UploadState();
+                if (warnings.Count > 0)
+                    state["uploadedDespite"] = warnings;
+                if (isNew && !ConceptNaming.TryParse(name, out _))
+                    state["note"] = "The concept name is not playable<number>_<game>_<yymmdd>[_suffix].";
+                state["hint"] = "Call unity_build_report every 15-30 s until upload.state is finished. The plugin opens the Creative " +
+                                "Library page in the browser when the upload is done.";
+                return state;
+            }, ChecksTimeoutMs);
+            bool wasRefused = started.ContainsKey("refused");
+            return wasRefused ? McpServer.ToolResult.Text(MiniJson.Write(started), true) : McpServer.ToolResult.Json(started);
+        }
+
+        static Dictionary<string, object> Refusal(string why) => new Dictionary<string, object> { { "refused", why } };
+
+        static UploadChecksPanel NewChecks() => new UploadChecksPanel { OnError = e => Debug.LogException(e) };
+
+        static int DefaultApplicationId()
+        {
+            int last = ProjectBuildState.LastApplicationId;
+            return last != 0 ? last : LunaPluginBridge.SavedApplicationId;
+        }
+
+        static LunaPluginBridge.App[] LoadApps()
+        {
+            AwaitMainThreadTask(LunaPluginBridge.LoadApps, "Playground applications");
+            return OnMainThread(() => LunaPluginBridge.Apps);
+        }
+
+        static LunaPluginBridge.Concept[] LoadConcepts(int appId)
+        {
+            AwaitMainThreadTask(() => LunaPluginBridge.LoadConcepts(appId), "Playground concepts");
+            return OnMainThread(() => LunaPluginBridge.Concepts.OrderByDescending(c => c.Name, StringComparer.OrdinalIgnoreCase).ToArray());
+        }
+
+        // Starts a plugin Task on the main thread (its continuations run there) and waits for it from the request thread.
+        static void AwaitMainThreadTask(Func<System.Threading.Tasks.Task> start, string what)
+        {
+            System.Threading.Tasks.Task task = OnMainThread(start);
+            DateTime until = DateTime.UtcNow.AddMilliseconds(PlaygroundTimeoutMs);
+            while (!task.IsCompleted && DateTime.UtcNow < until)
+                Thread.Sleep(100);
+            if (!task.IsCompleted)
+                throw new TimeoutException("Playground did not answer in time (" + what + "). Retry in a moment.");
+            if (task.IsFaulted)
+                throw new InvalidOperationException("Loading " + what + " failed: " + task.Exception?.GetBaseException().Message);
+        }
+
+        // Main thread: notices the end of the plugin's Build & upload and keeps its result across a domain reload.
+        static void TrackUpload()
+        {
+            string json = SessionState.GetString(UploadKey, null);
+            if (string.IsNullOrEmpty(json))
+                return;
+            var upload = MiniJson.Obj(MiniJson.Parse(json)) ?? new Dictionary<string, object>();
+            if (SafeIsBuilding())
+            {
+                if (!MiniJson.Bool(upload, "sawBuilding", false))
+                {
+                    upload["sawBuilding"] = true;
+                    SessionState.SetString(UploadKey, MiniJson.Write(upload));
+                }
+                return;
+            }
+            double startedAt = MiniJson.Num(upload, "startedAtEditor", 0);
+            if (!MiniJson.Bool(upload, "sawBuilding", false) && EditorApplication.timeSinceStartup - startedAt < UploadStartTimeout)
+                return;
+            BuildReport report = BuildDiagnostics.Collect("Build & upload", true, false, MiniJson.Str(upload, "reportBefore"));
+            var summary = BuildSummary(report, report.Failed ? null : "Build & upload finished at " + DateTime.Now.ToString("HH:mm") + ".");
+            foreach (string key in new[] { "application", "applicationId", "concept", "newConcept", "startedAt" })
+                summary[key] = upload.TryGetValue(key, out object v) ? v : null;
+            summary["finishedAt"] = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+            summary["seconds"] = Math.Round(EditorApplication.timeSinceStartup - startedAt, 1);
+            if (!MiniJson.Bool(upload, "sawBuilding", false))
+                summary["note"] = "The plugin never showed as building: check its window or the Console.";
+            SessionState.SetString(UploadResultKey, MiniJson.Write(summary));
+            SessionState.EraseString(UploadKey);
+        }
+
+        static Dictionary<string, object> UploadState()
+        {
+            string running = SessionState.GetString(UploadKey, null), result = SessionState.GetString(UploadResultKey, null);
+            if (!string.IsNullOrEmpty(running))
+            {
+                var upload = MiniJson.Obj(MiniJson.Parse(running)) ?? new Dictionary<string, object>();
+                var state = new Dictionary<string, object> { { "state", "running" } };
+                foreach (string key in new[] { "application", "applicationId", "concept", "newConcept", "startedAt" })
+                    state[key] = upload.TryGetValue(key, out object v) ? v : null;
+                state["seconds"] = Math.Round(EditorApplication.timeSinceStartup - MiniJson.Num(upload, "startedAtEditor", 0), 1);
+                try
+                {
+                    if (LunaPluginBridge.IsAvailable && LunaPluginBridge.TryGetProgress(out string label, out float fraction))
+                    {
+                        state["step"] = label;
+                        state["progress"] = Math.Round(fraction, 2);
+                    }
+                }
+                catch (Exception)
+                {
+                    // Progress is only informative.
+                }
+                return state;
+            }
+            if (!string.IsNullOrEmpty(result))
+            {
+                var finished = MiniJson.Obj(MiniJson.Parse(result)) ?? new Dictionary<string, object>();
+                finished["state"] = "finished";
+                return finished;
+            }
+            return new Dictionary<string, object> { { "state", "none" } };
         }
 
         static Dictionary<string, object> BuildSummary(BuildReport report, string status)

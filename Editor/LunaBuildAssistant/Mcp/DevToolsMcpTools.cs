@@ -21,6 +21,8 @@ namespace Supercent.Util.Editor
             "- Performance: luna_get_stats (frame time, draw calls, heap), luna_record_hot_paths (cost per script callback / coroutine and the " +
             "methods called inside, while the game is played), luna_capture_frame (draw calls of one frame).\n" +
             "- State: luna_find_objects / luna_get_object read the scene; luna_watch_field records who changes a field (with C# stack).\n" +
+            "- Upload: only when the user asks. unity_upload_targets lists applications / concepts and the pre-upload warnings; confirm the " +
+            "application and concept with the user, then unity_build_upload and poll unity_build_report (upload.state).\n" +
             "- Tools marked as changing the page (luna_control, luna_eval) can run game code: Luna's runtime analysis then counts that code as " +
             "used, so the cloud build may keep a little more code. Prefer reading tools; tell the user to replay normally before uploading.";
 

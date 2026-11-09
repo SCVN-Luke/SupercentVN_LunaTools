@@ -56,9 +56,17 @@ namespace Supercent.Util.Editor
         }
 
         // The plugin keeps the develop server port per project, under the Assets path in base64.
-        public static int UpstreamPort =>
-            EditorPrefs.GetInt(UpstreamPortPref + Convert.ToBase64String(Encoding.UTF8.GetBytes(Application.dataPath)), DefaultUpstreamPort);
+        static string UpstreamPortKey => UpstreamPortPref + Convert.ToBase64String(Encoding.UTF8.GetBytes(Application.dataPath));
 
+        public static int UpstreamPort => EditorPrefs.GetInt(UpstreamPortKey, DefaultUpstreamPort);
+
+        public static string ProjectPath => Directory.GetParent(Application.dataPath).FullName;
+
+        // Why a port changed at the last start (another project keeps it), for the window and luna_status.
+        public static string PortNote { get; private set; }
+
+        // Starts the proxy on the ports this project keeps on this machine (LunaMachine), so several projects run
+        // side by side and agents find each one at the same address after every restart.
         public static bool Start()
         {
             LastError = null;
@@ -75,7 +83,19 @@ namespace Supercent.Util.Editor
             }
             try
             {
-                proxy = DevToolsProxy.Start(FirstPort, PortCount, UpstreamPort, script);
+                int current = EditorPrefs.HasKey(UpstreamPortKey) ? EditorPrefs.GetInt(UpstreamPortKey) : DefaultUpstreamPort;
+                LunaMachine.Ports ports = LunaMachine.Assign(ProjectPath, current, DevToolsProxy.CanListen, p => !DevToolsProxy.IsListening(p, 100));
+                PortNote = ports.Note;
+                if (ports.Develop != current)
+                {
+                    EditorPrefs.SetInt(UpstreamPortKey, ports.Develop);
+                    PortNote = (PortNote + " Restart the develop server (or Unity) if it already runs on " + current + ".").Trim();
+                }
+                if (PortNote != null)
+                    Debug.LogWarning("[LunaBuildAssistant] " + PortNote);
+                proxy = DevToolsProxy.TryStart(ports.DevTools, ports.Develop, script)
+                        ?? DevToolsProxy.Start(FirstPort, PortCount, ports.Develop, script);   // Taken in between: any free port.
+                proxy.ExpectedProjectId = ProjectId();
                 AttachAgents();
                 return true;
             }
@@ -119,6 +139,9 @@ namespace Supercent.Util.Editor
                     while (!await Task.Run(() => DevToolsProxy.IsListening(upstream)) && EditorApplication.timeSinceStartup < until)
                         await Task.Delay(250);
                 }
+                string other = await Task.Run(() => UpstreamProblem);
+                if (other != null)
+                    Debug.LogError("[LunaBuildAssistant] Dev Tools: " + other);
                 Application.OpenURL(LocalUrl);
             }
             catch (Exception e)
@@ -127,6 +150,24 @@ namespace Supercent.Util.Editor
                 Debug.LogException(e);
             }
         }
+
+        // luna.json projectId, to recognise this project's build on the develop server.
+        static string ProjectId()
+        {
+            try
+            {
+                string json = File.ReadAllText(Path.Combine(ProjectPath, "luna.json"));
+                var match = System.Text.RegularExpressions.Regex.Match(json, "\"projectId\"\\s*:\\s*\"(?<v>[^\"]+)\"");
+                return match.Success ? match.Groups["v"].Value : null;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        // Null when the develop server serves this project's build (or is not running).
+        public static string UpstreamProblem => proxy?.OtherProjectUpstream();
 
         static string ScriptFile([CallerFilePath] string self = "")
         {

@@ -45,8 +45,13 @@ namespace Supercent.Util.Editor
 
         readonly Dictionary<string, Tool> tools = new Dictionary<string, Tool>();
         readonly object gate = new object();
-        public string Version = "1.0.0";
+        public string Version = "1.1.0";
         public string Instructions;
+
+        // Every tool takes an optional "project" argument (the Unity project the call is meant for); CheckProject returns
+        // why it does not match this server (the call is then refused), or null. Unset: no such argument.
+        public const string ProjectArgument = "project";
+        public Func<string, string> CheckProject;
 
         public void Register(Tool tool)
         {
@@ -125,7 +130,7 @@ namespace Supercent.Util.Editor
                             {
                                 { "name", t.Name },
                                 { "description", t.Description },
-                                { "inputSchema", t.InputSchema ?? Schema() },
+                                { "inputSchema", WithProject(t.InputSchema ?? Schema()) },
                                 { "annotations", new Dictionary<string, object> { { "readOnlyHint", t.ReadOnly }, { "openWorldHint", false } } },
                             }).ToList() },
                     });
@@ -150,7 +155,8 @@ namespace Supercent.Util.Editor
                 try
                 {
                     var args = MiniJson.Obj(parameters.TryGetValue("arguments", out object a) ? a : null) ?? new Dictionary<string, object>();
-                    result = tool.Run(args) ?? ToolResult.Text("Done.");
+                    string wrongProject = CheckProject?.Invoke(MiniJson.Str(args, ProjectArgument));
+                    result = wrongProject != null ? ToolResult.Text(wrongProject, true) : tool.Run(args) ?? ToolResult.Text("Done.");
                 }
                 catch (Exception e)
                 {
@@ -172,6 +178,22 @@ namespace Supercent.Util.Editor
                 { "jsonrpc", "2.0" }, { "id", id },
                 { "error", new Dictionary<string, object> { { "code", code }, { "message", message } } },
             };
+
+        Dictionary<string, object> WithProject(Dictionary<string, object> schema)
+        {
+            if (CheckProject == null || !(schema.TryGetValue("properties", out object p) && p is Dictionary<string, object> properties)
+                || properties.ContainsKey(ProjectArgument))
+                return schema;
+            var copy = new Dictionary<string, object>(schema)
+            {
+                ["properties"] = new Dictionary<string, object>(properties)
+                {
+                    [ProjectArgument] = Prop("string", "Unity project this call is for (path or folder name). Optional: the call is refused " +
+                                                       "when this Editor has another project open."),
+                },
+            };
+            return copy;
+        }
 
         // JSON Schema helpers for tool inputs.
         public static Dictionary<string, object> Schema(Dictionary<string, object> properties = null, params string[] required)

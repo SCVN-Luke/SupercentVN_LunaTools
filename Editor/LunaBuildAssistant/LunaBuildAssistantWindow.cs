@@ -416,12 +416,21 @@ namespace Supercent.Util.Editor
                 {
                     int pages = LunaMcp.ConnectedPages;
                     GUILayout.Label(new GUIContent($"MCP: {url}   {pages} page(s) connected",
+                        "This project keeps this address on this machine, also with other Luna projects open.\n" +
                         "Pages connect when the Build Develop page is opened through the Dev Tools."), AssistantUI.Caption);
-                    if (EditorGUILayout.LinkButton(new GUIContent("Copy Claude Code command", LunaMcp.ClaudeCommand)))
+                    if (EditorGUILayout.LinkButton(new GUIContent("Copy Claude Code command",
+                            "Run once per machine. Registers the MCP broker, which starts with the agent (also before Unity is open) " +
+                            "and sends each call to the Editor of the agent's project:\n" + LunaMcp.ClaudeCommand)))
                         EditorGUIUtility.systemCopyBuffer = LunaMcp.ClaudeCommand;
                 }
                 GUILayout.FlexibleSpace();
             }
+            if (LunaDevTools.PortNote != null)
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    GUILayout.Space(18);
+                    GUILayout.Label(new GUIContent(LunaDevTools.PortNote, LunaDevTools.PortNote), AssistantUI.Caption);
+                }
         }
 
         string ChangesTooltip() =>
@@ -654,6 +663,10 @@ namespace Supercent.Util.Editor
             AssetDatabase.Refresh();
             if (EditorApplication.isCompiling || EditorApplication.isUpdating)
                 return "Unity is importing / compiling changed scripts. Call again in a few seconds (the MCP server comes back after the reload).";
+            // A modified Luna scene makes Unity / the plugin ask to save it: a modal dialog that stops the Editor until the user answers.
+            List<string> unsaved = LunaUpload.UnsavedLunaScenes();
+            if (unsaved.Count > 0)
+                return "Unsaved Luna scene(s): " + string.Join(", ", unsaved) + ". The user saves (or reverts) them in Unity first; agents never save scenes.";
             AgentBuildReport = null;
             AgentBuildStatus = null;
             agentBuildRunning = true;
@@ -728,18 +741,17 @@ namespace Supercent.Util.Editor
             int creativeId = isNew ? -1 : concepts[conceptIndex - 1].Id;
             try
             {
-                if (!PrepareScenes())
-                    return;
-                if (!LunaPluginBridge.ClearShaderVariants())
-                    Debug.LogWarning("[LunaBuildAssistant] Assets/SVC_Luna.asset not found; shader variant lists were not cleared.");
-                LunaPluginBridge.SaveUploadTarget(app.Id, name);
-                ProjectBuildState.LastApplicationId = app.Id;
                 report = null;
                 uploadReportBefore = BuildDiagnostics.CurrentReportId();
                 uploadStartedAt = EditorApplication.timeSinceStartup;
                 uploadSawBuilding = false;
-                LunaPluginBridge.BuildAndUpload(app.Id, creativeId);
-                StrippedCodeCheck.SaveBaseline();       // What this upload strips no longer counts as new.
+                string cancelled = LunaUpload.Start(app.Id, name, creativeId);
+                if (cancelled != null)
+                {
+                    uploadStartedAt = -1;
+                    status = cancelled;
+                    return;
+                }
                 checks.Invalidate();
                 status = $"Build & upload started: {app.Name} / {name}{(isNew ? " (new concept)" : string.Empty)}. " +
                          "The browser opens the Creative Library upload page when it is done.";
@@ -772,15 +784,7 @@ namespace Supercent.Util.Editor
         // Uploading work that was never checked in Build Develop, or that the checks flag, needs an explicit yes.
         bool ConfirmUpload()
         {
-            DateTime? last = ProjectBuildState.LastPrivateBuildUtc;
-            List<string> changes = ProjectBuildState.ChangesSincePrivateBuild();
-            var parts = new List<string>();
-            if (!last.HasValue)
-                parts.Add("Build Develop has not been run in this project yet.");
-            else if (changes.Count > 0)
-                parts.Add($"{changes.Count} change(s) since the last Build Develop ({last.Value.ToLocalTime():yyyy-MM-dd HH:mm}):\n- " +
-                          string.Join("\n- ", changes.Take(MaxListedChanges)) + (changes.Count > MaxListedChanges ? "\n…" : string.Empty));
-            parts.AddRange(checks.Warnings());
+            List<string> parts = LunaUpload.Warnings(checks);
             if (parts.Count == 0)
                 return true;
             return EditorUtility.DisplayDialog("Before uploading", string.Join("\n\n", parts) + "\n\nBuild & upload anyway?", "Build & Upload", "Cancel");

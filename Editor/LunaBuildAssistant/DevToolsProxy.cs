@@ -67,6 +67,23 @@ namespace Supercent.Util.Editor
             throw new IOException($"No free port between {firstPort} and {firstPort + portCount - 1}");
         }
 
+        // On exactly this port; null when it is taken.
+        public static DevToolsProxy TryStart(int port, int upstreamPort, string scriptFile)
+        {
+            TcpListener listener = Listen(port);
+            return listener == null ? null : new DevToolsProxy(listener, port, upstreamPort, scriptFile);
+        }
+
+        // Whether this process could listen on the port now.
+        public static bool CanListen(int port)
+        {
+            TcpListener listener = Listen(port);
+            if (listener == null)
+                return false;
+            listener.Stop();
+            return true;
+        }
+
         static TcpListener Listen(int port)
         {
             try
@@ -174,7 +191,15 @@ namespace Supercent.Util.Editor
                     else if (method == "GET" && path.EndsWith("/iframe.html", StringComparison.OrdinalIgnoreCase))
                         ServeInjected(browser, head, "agent");
                     else if (method == "GET" && (path == "/" || path.Equals("/index.html", StringComparison.OrdinalIgnoreCase)))
-                        ServeInjected(browser, head, "shell");
+                    {
+                        string other = OtherProjectUpstream();
+                        if (other != null)
+                            Respond(browser, "409 Conflict", "text/html; charset=utf-8", Encoding.UTF8.GetBytes(
+                                "<!doctype html><meta charset=utf-8><title>Luna Dev Tools</title><body style=\"font:14px system-ui;padding:24px\">" +
+                                "<h3>Another Luna project answers on this port</h3><p>" + WebUtility.HtmlEncode(other) + "</p>"));
+                        else
+                            ServeInjected(browser, head, "shell");
+                    }
                     else
                     {
                         Pipe(client, browser, head, rest);
@@ -287,6 +312,57 @@ namespace Supercent.Util.Editor
                 Thread.Sleep(100 * (attempt + 1));
             }
             return null;
+        }
+
+        // luna.json projectId of this project: the develop server must serve this project's build, not the one of
+        // another Unity Editor that took the port first. Null: no check.
+        public string ExpectedProjectId { get; set; }
+
+        static readonly Regex ProjectIdField = new Regex("\"projectId\"\\s*:\\s*\"(?<v>[^\"]*)\"");
+        static readonly Regex CreativeNameField = new Regex("\"creativeName\"\\s*:\\s*\"(?<v>[^\"]*)\"");
+
+        // Null when the develop server serves this project (or cannot be asked), otherwise what it serves instead.
+        public string OtherProjectUpstream()
+        {
+            string expected = ExpectedProjectId;
+            if (string.IsNullOrEmpty(expected))
+                return null;
+            try
+            {
+                string served = Fetch("/luna.json");
+                Match id = served == null ? Match.Empty : ProjectIdField.Match(served);
+                if (!id.Success || id.Groups["v"].Value == expected)
+                    return null;
+                Match name = CreativeNameField.Match(served);
+                return $"The develop server on port {upstreamPort} serves another project" +
+                       (name.Success ? $" ({name.Groups["v"].Value})" : string.Empty) +
+                       ". Another Unity Editor took this port: change the develop server port in the Unity Playworks Plugin " +
+                       "(Develop > Server) or close the other project's server, then Build Develop again.";
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        // GET one file from the develop server; the body as text, null when it does not answer with 200.
+        string Fetch(string path)
+        {
+            TcpClient upstream = Connect();
+            if (upstream == null)
+                return null;
+            using (upstream)
+            {
+                upstream.ReceiveTimeout = ConnectTimeoutMs;
+                NetworkStream server = upstream.GetStream();
+                byte[] request = Latin1.GetBytes($"GET {path} HTTP/1.0\r\nHost: localhost:{upstreamPort}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n");
+                server.Write(request, 0, request.Length);
+                byte[] response = ReadToEnd(server);
+                int headEnd = IndexOf(response, response.Length, HeaderEnd);
+                if (headEnd < 0 || !Latin1.GetString(response, 0, Math.Min(headEnd, 20)).Contains(" 200"))
+                    return null;
+                return Encoding.UTF8.GetString(response, headEnd + HeaderEnd.Length, response.Length - headEnd - HeaderEnd.Length);
+            }
         }
 
         TcpClient ConnectUpstream(Stream browser)
