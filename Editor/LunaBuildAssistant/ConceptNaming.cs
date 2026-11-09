@@ -15,6 +15,9 @@ namespace Supercent.Util.Editor
 
         static readonly Regex NamePattern = new Regex(@"^(?<prefix>playable)(?<number>\d+)_(?<game>[^_]+)_(?<date>\d{6})(?:_(?<suffix>.+))?$", RegexOptions.IgnoreCase);
         static readonly Regex BranchPattern = new Regex(@"playable[_-]?(?<number>\d+)", RegexOptions.IgnoreCase);
+        // Fallback: the last number token of the branch's last segment, e.g. "VN/luna_dragonburst_002". At most 4 digits so
+        // a date (yymmdd) is never taken for a playable number.
+        static readonly Regex BranchNumberToken = new Regex(@"(?:^|[_.-])(?<number>\d{1,4})(?=$|[_.-])", RegexOptions.RightToLeft);
         static readonly Regex NonWord = new Regex(@"[^\w\d]+");    // Same set the Playworks upload tab replaces.
         static readonly Regex NonAlphanumeric = new Regex(@"[^\p{L}\p{Nd}]+");   // "_" would split the game token.
 
@@ -41,10 +44,16 @@ namespace Supercent.Util.Editor
             return true;
         }
 
-        // "VN/playable009" -> "009"; null when the branch carries no playable number.
+        // "VN/playable009" -> "009", "VN/luna_dragonburst_002" -> "002"; null when the branch carries no playable number.
         public static string NumberFromBranch(string branch)
         {
-            Match m = branch == null ? Match.Empty : BranchPattern.Match(branch);
+            if (string.IsNullOrWhiteSpace(branch))
+                return null;
+            Match m = BranchPattern.Match(branch);
+            if (m.Success)
+                return m.Groups["number"].Value;
+            string last = branch.Substring(branch.LastIndexOf('/') + 1);
+            m = BranchNumberToken.Match(last);
             return m.Success ? m.Groups["number"].Value : null;
         }
 
@@ -63,7 +72,14 @@ namespace Supercent.Util.Editor
 
             string name = $"{prefix}{number}_{game}_{today.ToString("yyMMdd", CultureInfo.InvariantCulture)}";
             string cleanSuffix = Sanitize(suffix).Trim('-', '_');
-            return cleanSuffix.Length > 0 ? name + "_" + cleanSuffix : name;
+            if (cleanSuffix.Length > 0)
+                name += "_" + cleanSuffix;
+            // Never suggest a name the app already has (e.g. the branch's concept was created today): add _2, _3, ...
+            var taken = new HashSet<string>(conceptNames ?? Enumerable.Empty<string>(), StringComparer.OrdinalIgnoreCase);
+            string unique = name;
+            for (int n = 2; taken.Contains(unique); n++)
+                unique = name + "_" + n.ToString(CultureInfo.InvariantCulture);
+            return unique;
         }
 
         // Latest concept carrying the branch's playable number, or null to create a new one.
