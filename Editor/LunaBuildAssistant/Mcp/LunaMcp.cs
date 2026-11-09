@@ -116,8 +116,8 @@ namespace Supercent.Util.Editor
             return broker != null && File.Exists(broker) ? broker : null;
         }
 
-        public static string BrokerCommand(string agentName = "luna-devtools") =>
-            $"claude mcp add -s user {agentName} -- node \"{LunaMachine.BrokerFile}\"";
+        // node's full path when known: agents started from the Dock do not see the shell's PATH.
+        public static string BrokerCommand() => LunaAgents.ClaudeCommand(LunaAgents.Node, LunaMachine.BrokerFile);
 
         static void SaveCompileResult()
         {

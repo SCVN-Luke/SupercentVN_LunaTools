@@ -1,9 +1,10 @@
 #!/usr/bin/env node
-// luna-mcp-broker version: 2
+// luna-mcp-broker version: 3
 //
 // MCP server (stdio) for AI agents, in front of the Luna Build Assistant's MCP endpoint in each open Unity Editor.
 // The agent starts it, so its tools exist even before Unity is open, and every call goes to the Editor of the
-// agent's project (found from the working directory) while several Luna projects are open side by side.
+// agent's project while several Luna projects are open side by side. The project is found from LUNA_PROJECT, else the
+// folders the agent shares as MCP roots (Cursor, VS Code ... start servers outside the project), else the working directory.
 //
 // Editors publish themselves in ~/.supercent/luna-mcp (see LunaMachine.cs / LunaInstance.cs):
 //   instances/*.json  one per running Editor: projectPath, pid, mcpUrl, state
@@ -14,8 +15,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
+import { fileURLToPath } from 'node:url';
 
-const VERSION = '1.0.1';
+const VERSION = '1.1.0';
 const STALL_SECONDS = 15;          // No heartbeat for this long: the Editor's main thread is blocked.
 const ROOT = path.join(os.homedir(), '.supercent', 'luna-mcp');
 const INSTANCES = path.join(ROOT, 'instances');
@@ -72,10 +74,23 @@ function instances() {
   return list;
 }
 
-const workDir = norm(process.env.LUNA_PROJECT || process.cwd());
+// LUNA_PROJECT from the agent's config; ignored when the agent left a variable such as ${workspaceFolder} unresolved.
+const envProject = (() => {
+  const value = (process.env.LUNA_PROJECT || '').trim();
+  if (!value || value.includes('${')) return null;
+  try { return fs.statSync(value).isDirectory() ? norm(value) : null; } catch { return null; }
+})();
+let rootDirs = [];      // From the agent's MCP roots (roots/list), when it shares them.
 
-// Unity projects at or under the working directory (a repository usually holds one under unity_project/).
-function unityProjectsHere() {
+// Where this agent works: the folders whose Unity project calls go to by default.
+function workDirs() {
+  if (envProject) return [envProject];
+  if (rootDirs.length > 0) return rootDirs;
+  return [norm(process.cwd())];
+}
+
+// Unity projects at or under a working directory (a repository usually holds one under unity_project/).
+function unityProjectsHere(workDir) {
   const found = [];
   const isProject = (dir) => fs.existsSync(path.join(dir, 'ProjectSettings', 'ProjectVersion.txt'));
   const scan = (dir, depth) => {
@@ -108,16 +123,19 @@ function resolve(project) {
       return { error: `Several open Editors match "${wanted}": ${matches.map((m) => m.projectPath).join(', ')}. Pass the full path.` };
     return { error: `No open Unity Editor has "${wanted}" open. ${describeOpen(open)}` };
   }
-  const here = open.filter((i) => same(i.projectPath, workDir) || inside(i.projectPath, workDir) || inside(workDir, i.projectPath));
-  if (here.length === 1) return { instance: here[0] };
-  if (here.length > 1)
-    return { error: `Several open Editors are under ${workDir}: ${here.map((m) => m.projectPath).join(', ')}. Pass "project".` };
-  const local = unityProjectsHere();
+  const dirs = workDirs();
+  for (const workDir of dirs) {
+    const here = open.filter((i) => same(i.projectPath, workDir) || inside(i.projectPath, workDir) || inside(workDir, i.projectPath));
+    if (here.length === 1) return { instance: here[0] };
+    if (here.length > 1)
+      return { error: `Several open Editors are under ${workDir}: ${here.map((m) => m.projectPath).join(', ')}. Pass "project".` };
+  }
+  const local = dirs.flatMap(unityProjectsHere);
   if (local.length > 0)
     return { error: `The Unity Editor of ${local.join(' / ')} is not open (or still loading). Ask the user to open it in Unity ` +
                     `(Luna Build Assistant in Assets/SupercentVN/LunaTools), then call again. ${describeOpen(open)}` };
   if (open.length === 1) return { instance: open[0] };
-  return { error: `No Unity project in ${workDir}. ${describeOpen(open)} Pass "project".` };
+  return { error: `No Unity project in ${dirs.join(', ')}. ${describeOpen(open)} Pass "project".` };
 }
 
 function describeOpen(open) {
@@ -220,7 +238,8 @@ function listInstances() {
   return {
     content: [{
       type: 'text', text: JSON.stringify({
-        workingDirectory: workDir,
+        workingDirectory: workDirs().join(', '),
+        workingDirectoryFrom: envProject ? 'LUNA_PROJECT' : rootDirs.length > 0 ? 'MCP roots' : 'process working directory',
         defaultProject: target.instance ? target.instance.projectPath : null,
         defaultProblem: target.error || null,
         instances: open.map((i) => ({
@@ -241,17 +260,40 @@ function send(message) {
   process.stdout.write(JSON.stringify(message) + '\n');
 }
 
+// ---- MCP roots: the folders the agent works in ----
+
+let clientRoots = false;
+let rootsRequest = 0;
+
+function askRoots() {
+  if (clientRoots && !envProject) send({ jsonrpc: '2.0', id: `luna-roots-${++rootsRequest}`, method: 'roots/list' });
+}
+
+function takeRoots(result) {
+  const dirs = [];
+  for (const root of Array.isArray(result?.roots) ? result.roots : []) {
+    try { if (String(root.uri).startsWith('file:')) dirs.push(norm(fileURLToPath(root.uri))); } catch { /* not a local folder */ }
+  }
+  rootDirs = dirs;
+}
+
 async function handle(msg) {
   if (!msg || typeof msg !== 'object') return;
   const { id, method, params } = msg;
+  if (method === undefined && id !== undefined) {         // The agent's answer to roots/list.
+    if (String(id).startsWith('luna-roots-')) takeRoots(msg.result);
+    return;
+  }
   if (id === undefined || id === null) {
-    if (method === 'notifications/initialized') initialized = true;
+    if (method === 'notifications/initialized') { initialized = true; askRoots(); }
+    else if (method === 'notifications/roots/list_changed') askRoots();
     return;
   }
   try {
     switch (method) {
       case 'initialize': {
         const asked = params?.protocolVersion;
+        clientRoots = !!params?.capabilities?.roots;
         const cached = cachedTools().instructions;
         send({ jsonrpc: '2.0', id, result: {
           protocolVersion: PROTOCOLS.includes(asked) ? asked : PROTOCOLS[0],

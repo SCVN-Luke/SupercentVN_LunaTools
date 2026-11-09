@@ -68,18 +68,41 @@ when Unity quits. The last tool list is kept in `tools.json`.
 
 Agents start the broker `~/.supercent/luna-mcp/luna-mcp.mjs` (Node 18+, no packages; installed and
 updated there by the Assistant from `Editor/LunaBuildAssistant/Mcp/Broker~`, newest version wins).
-"Copy Claude Code command" in the Assistant copies:
+
+Build Develop → "AI agents" lists the agents found on this machine and whether each has the broker;
+**Auto configure** writes the `luna-devtools` entry into each one's user-level MCP config
+(`Mcp/LunaAgents.cs`), with node's full path (agents started from the Dock do not see the shell's PATH):
+
+| Agent | Config written |
+| --- | --- |
+| Claude Code | `claude mcp add -s user` (its CLI owns `~/.claude.json`) |
+| Codex (CLI, IDE extension, app) | `~/.codex/config.toml` → `[mcp_servers.luna-devtools]` (`$CODEX_HOME` if set) |
+| Cursor | `~/.cursor/mcp.json` → `mcpServers` (+ `LUNA_PROJECT=${workspaceFolder}`) |
+| Antigravity | `~/.gemini/antigravity/mcp_config.json` → `mcpServers` |
+| Gemini CLI | `~/.gemini/settings.json` → `mcpServers` |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` → `mcpServers` |
+| VS Code (Copilot agent mode) | `<user dir>/Code/User/mcp.json` → `servers` (+ `LUNA_PROJECT=${workspaceFolder}`) |
+
+Only that entry changes (Codex: only its `command` / `args`, tool approvals kept); the rest of each file
+is kept, and the file is copied to `<file>.luna-backup` before its first change. A file with comments
+(not plain JSON) is left alone and the window shows the entry to add by hand. Restart the agent (or
+reload its MCP servers) afterwards. Daily use so far: Claude Code; the other agents are configured the
+same way but less tested.
+
+By hand, Claude Code: "Copy Claude Code command" copies
 
 ```sh
-claude mcp add -s user luna-devtools -- node "$HOME/.supercent/luna-mcp/luna-mcp.mjs"
+claude mcp add -s user luna-devtools -- /opt/homebrew/bin/node "$HOME/.supercent/luna-mcp/luna-mcp.mjs"
 ```
 
-(Use the full path of `node` if the agent does not see your shell's PATH, e.g. `/opt/homebrew/bin/node`.)
 Remove an older per-project registration first: `claude mcp remove luna-devtools -s local`.
 
 The broker runs with the agent, so its tools exist even before Unity is open. Each call goes to the
-Editor whose project is at or under the agent's working directory (or `project`: path or folder name;
-`luna_instances` lists the open Editors and the ports each project keeps). While that Editor is not
+Editor whose project is at or under the agent's folder (or `project`: path or folder name;
+`luna_instances` lists the open Editors and the ports each project keeps). The agent's folder is
+`LUNA_PROJECT` when set (ignored while it still holds an unresolved `${...}`), else the folders the agent
+shares as MCP roots (agents such as VS Code start servers outside the project), else the working directory.
+While that Editor is not
 open, the call says so; while it reloads scripts, the broker waits for it (up to 60 s); when its main
 thread stops updating (a dialog waiting in Unity), the error says so. Every Editor tool also takes
 `project` and refuses calls meant for another project, so a call never builds or uploads the wrong one.
@@ -133,12 +156,6 @@ runtime analysis is unchanged; `luna_control`, `luna_simulate` and `luna_eval` r
 Static initializers are wrapped to report their exceptions (called through unchanged, rethrown).
 The protocol, channel and JSON code (`Mcp/`, `DevToolsProxy`, `LunaMachine`) use no Unity API and are
 tested outside the Editor.
-
-### TODO
-
-- Other agents (Codex, Cursor, Antigravity, ...): register the same broker in their MCP config, with an
-  "Auto configure" button in the Assistant that writes it for each agent found on the machine. After
-  the broker has been tested in daily use.
 
 ## Changing the tool
 

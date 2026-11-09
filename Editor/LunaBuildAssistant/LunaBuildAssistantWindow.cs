@@ -418,18 +418,66 @@ namespace Supercent.Util.Editor
                     GUILayout.Label(new GUIContent($"MCP: {url}   {pages} page(s) connected",
                         "This project keeps this address on this machine, also with other Luna projects open.\n" +
                         "Pages connect when the Build Develop page is opened through the Dev Tools."), AssistantUI.Caption);
-                    if (EditorGUILayout.LinkButton(new GUIContent("Copy Claude Code command",
-                            "Run once per machine. Registers the MCP broker, which starts with the agent (also before Unity is open) " +
-                            "and sends each call to the Editor of the agent's project:\n" + LunaMcp.ClaudeCommand)))
-                        EditorGUIUtility.systemCopyBuffer = LunaMcp.ClaudeCommand;
                 }
                 GUILayout.FlexibleSpace();
             }
+            if (LunaMcp.Url != null)
+                DrawAgents();
             if (LunaDevTools.PortNote != null)
                 using (new EditorGUILayout.HorizontalScope())
                 {
                     GUILayout.Space(18);
                     GUILayout.Label(new GUIContent(LunaDevTools.PortNote, LunaDevTools.PortNote), AssistantUI.Caption);
+                }
+        }
+
+        // AI agents found on this machine and whether the MCP broker is registered in each (read once, and after Auto configure).
+        static List<LunaAgents.Agent> agents;
+        static string agentsNote;
+
+        static void DrawAgents()
+        {
+            if (agents == null)
+                agents = LunaAgents.Detect(LunaAgents.Node, LunaMachine.BrokerFile);
+            var ready = agents.Where(a => a.State == LunaAgents.State.Configured).Select(a => a.Name).ToList();
+            var todo = agents.Where(a => a.State == LunaAgents.State.Missing || a.State == LunaAgents.State.Outdated).Select(a => a.Name).ToList();
+            string details = LunaAgents.Describe(agents);
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                GUILayout.Space(18);
+                string text = agents.Count == 0 ? "AI agents: none found"
+                    : "AI agents: " + (ready.Count > 0 ? string.Join(", ", ready) + " ready" : "none set up")
+                    + (todo.Count > 0 ? " · not set up: " + string.Join(", ", todo) : string.Empty);
+                GUILayout.Label(new GUIContent(text, details), AssistantUI.Caption);
+                GUILayout.FlexibleSpace();
+            }
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                GUILayout.Space(18);
+                using (new EditorGUI.DisabledScope(todo.Count == 0))
+                    if (EditorGUILayout.LinkButton(new GUIContent("Auto configure",
+                            "Registers the MCP broker in each agent found on this machine (user-level config, every project):\n" + details +
+                            "\n\nThe broker starts with the agent (also before Unity is open) and sends each call to the Editor of the agent's project. " +
+                            "Only the " + LunaAgents.ServerName + " entry is written; each file is backed up first (.luna-backup).")))
+                    {
+                        agentsNote = LunaAgents.ConfigureAll(agents, LunaAgents.Node, LunaMachine.BrokerFile);
+                        agents = null;
+                    }
+                if (EditorGUILayout.LinkButton(new GUIContent("Copy Claude Code command",
+                        "Run once per machine in a terminal, if Auto configure cannot run the claude command:\n" + LunaMcp.ClaudeCommand)))
+                    EditorGUIUtility.systemCopyBuffer = LunaMcp.ClaudeCommand;
+                if (EditorGUILayout.LinkButton(new GUIContent("Refresh", "Read the agents' config files again.")))
+                {
+                    agents = null;
+                    agentsNote = null;
+                }
+                GUILayout.FlexibleSpace();
+            }
+            if (agentsNote != null)
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    GUILayout.Space(18);
+                    GUILayout.Label(new GUIContent(agentsNote, agentsNote), AssistantUI.WrappedCaption);
                 }
         }
 
