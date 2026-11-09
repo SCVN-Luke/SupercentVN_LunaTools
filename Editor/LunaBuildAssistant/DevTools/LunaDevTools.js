@@ -1659,7 +1659,13 @@
             '.log .cs{color:#8fb8ff;margin-top:2px;word-break:break-word}',
             'details summary{cursor:pointer;opacity:.6;font-size:10.5px}',
             'pre{white-space:pre-wrap;word-break:break-all;font-size:10px;opacity:.75;margin:2px 0}',
-            '.inner{padding:2px 0 4px 10px;font-size:10.5px;opacity:.8}'
+            '.inner{padding:2px 0 4px 10px;font-size:10.5px;opacity:.8}',
+            // Name cells: the class part shrinks with an ellipsis first, so the method name stays readable.
+            'td.nmc{max-width:none;overflow:visible}',
+            '.nm{display:flex;min-width:0;max-width:var(--nmw,170px)}',
+            '.nm .ns{flex:0 1000 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+            '.nm .me{flex:0 1 auto;min-width:0;max-width:calc(100% - 3em);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+            'table.wide{--nmw:230px}'
         ].join('\n');
 
         var where = inPlayable ? 'playable.' : 'shell.';
@@ -1728,6 +1734,31 @@
         function kb(v) { return v === null || v === undefined ? '–' : v >= 1048576 ? (v / 1048576).toFixed(2) + ' MB' : (v / 1024).toFixed(1) + ' KB'; }
         function cls(v, warn, bad) { return v >= bad ? 'bad' : v >= warn ? 'warn' : ''; }
         function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+
+        // Name cell: `owner` shrinks first (ellipsis), `member` (".Method") stays visible. Full name goes in the row title.
+        function nameCell(owner, member) {
+            return '<td class="nmc"><div class="nm"><span class="ns">' + esc(owner) + '</span>' +
+                (member ? '<span class="me">' + esc(member) + '</span>' : '') + '</div></td>';
+        }
+
+        // "Name.Space.Class#Method" → "Class.Method".
+        function shortMethod(name) {
+            var hash = name.indexOf('#'), owner = hash < 0 ? name : name.substring(0, hash);
+            return owner.substring(owner.lastIndexOf('.') + 1) + (hash < 0 ? '' : '.' + name.substring(hash + 1));
+        }
+
+        // "Name.Space.Class#Method" → ["Class", ".Method"]; a class name alone → ["Class", ""].
+        function methodCell(name) {
+            var hash = name.indexOf('#'), owner = hash < 0 ? name : name.substring(0, hash);
+            owner = owner.substring(owner.lastIndexOf('.') + 1);
+            return nameCell(owner, hash < 0 ? '' : '.' + name.substring(hash + 1));
+        }
+
+        // "Script.Callback" or "Script.Method (coroutine)" (namespace already dropped) → ["Script", ".Callback"].
+        function scriptCell(name) {
+            var dot = name.indexOf('.');
+            return dot < 0 ? nameCell(name, '') : nameCell(name.substring(0, dot), name.substring(dot));
+        }
 
         function grid(rows) {
             return '<div class="grid">' + rows.map(function (r) {
@@ -1856,13 +1887,13 @@
                 scriptRows.forEach(function (r) {
                     var open = expandedScript === r.name;
                     html += '<tr class="click' + (open ? ' sel' : '') + '" data-script="' + esc(r.name) + '" title="' + esc(r.name +
-                        (r.objects.length ? '\nOn: ' + r.objects.join(', ') : '') + '\n' + perFrame(r.callsPerFrame) + ' call(s) / frame') + '"><td>' + esc(r.name) +
-                        '</td><td class="' + cls(r.selfMs, 1, 3) + '">' + r.selfMs.toFixed(3) + '</td><td>' + r.totalMs.toFixed(3) +
+                        (r.objects.length ? '\nOn: ' + r.objects.join(', ') : '') + '\n' + perFrame(r.callsPerFrame) + ' call(s) / frame') + '">' + scriptCell(r.name) +
+                        '<td class="' + cls(r.selfMs, 1, 3) + '">' + r.selfMs.toFixed(3) + '</td><td>' + r.totalMs.toFixed(3) +
                         '</td><td>' + r.worstMs.toFixed(2) + '</td><td class="' + cls(r.tracesPerFrame, 500, 2000) + '">' + perFrame(r.tracesPerFrame) + '</td></tr>';
                     if (open) {
                         html += '<tr><td colspan="5"><div class="inner">' + (r.objects.length ? 'On: ' + esc(r.objects.join(', ')) + '<br>' : '') +
                             (r.inner.length ? r.inner.map(function (i) {
-                                return (i.project ? '<b>' : '') + esc(i.name) + (i.project ? '</b>' : '') + ' — ' + perFrame(i.perFrame) + '/frame';
+                                return '<span title="' + esc(i.name) + '">' + (i.project ? '<b>' : '') + esc(shortMethod(i.name)) + (i.project ? '</b>' : '') + '</span> — ' + perFrame(i.perFrame) + '/frame';
                             }).join('<br>') : 'No traced call inside') + '</div></td></tr>';
                     }
                 });
@@ -1878,9 +1909,9 @@
                 '<button data-act="hotclass" class="' + (hotByClass ? 'on' : '') + '">By class</button></div>';
             var rows = a.hot.top(40, hotFilter, hotByClass);
             if (rows.length) {
-                html += '<div class="scroll"><table><tr><th>' + (hotByClass ? 'Class' : 'Class#method') + '</th><th>/frame</th><th>peak</th><th>total</th></tr>';
+                html += '<div class="scroll"><table class="wide"><tr><th>' + (hotByClass ? 'Class' : 'Class.method') + '</th><th>/frame</th><th>peak</th><th>total</th></tr>';
                 rows.forEach(function (r) {
-                    html += '<tr title="' + esc(r.name + (r.methods ? '\n' + r.methods + ' method(s)' : '')) + '"><td>' + esc(r.name) + '</td><td class="' + cls(r.perFrame, 100, 1000) + '">' +
+                    html += '<tr title="' + esc(r.name + (r.methods ? '\n' + r.methods + ' method(s)' : '')) + '">' + methodCell(r.name) + '<td class="' + cls(r.perFrame, 100, 1000) + '">' +
                         perFrame(r.perFrame) + '</td><td>' + n(r.peak) + '</td><td>' + n(r.total) + '</td></tr>';
                 });
                 html += '</table></div>';
