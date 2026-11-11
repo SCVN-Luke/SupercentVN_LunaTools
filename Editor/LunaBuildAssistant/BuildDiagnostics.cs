@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using UnityEditor;
 using UnityEngine;
 
@@ -85,12 +86,17 @@ namespace Supercent.Util.Editor
         const string LocalizationFile = "LunaPlayable Localisation - LunaPlayable.csv";   // <package>/pipeline/resources
         const int MaxLogErrors = 20;
         const int MaxPlaceholders = 10;
+        const double SettleTimeout = 20;    // Seconds to wait for the plugin's report after a failed build.
+        const int SettlePollMs = 300;
 
-        // "Assets/Foo.cs(12,5): error CS1061: ..." anywhere in a log line.
+        // "Assets/Foo.cs(12,5): error CS1061: ... [Scripts.csproj]" anywhere in a log line.
         static readonly Regex CompilerError = new Regex(
-            @"(?<file>[^()\r\n\]]+?\.cs)\((?<line>\d+)(?:,\d+)?\)\s*:\s*error\s+(?<code>[A-Za-z]+\d+)\s*:\s*(?<msg>.+)$", RegexOptions.IgnoreCase);
+            @"(?<file>[^()\r\n\]$]+?\.cs)\((?<line>\d+)(?:,\d+)?\)\s*:\s*error\s+(?<code>[A-Za-z]+\d+)\s*:\s*(?<msg>.+?)(?:\s+\[[^\]]+\.csproj\])?$", RegexOptions.IgnoreCase);
         static readonly Regex ErrorWord = new Regex(@"\b(error|fatal|exception)\b", RegexOptions.IgnoreCase);
         static readonly Regex NoErrors = new Regex(@"\b0\s+errors?\b", RegexOptions.IgnoreCase);
+        static readonly Regex CompilerWarning = new Regex(@"\)\s*:\s*warning\s+[A-Za-z]+\d+\s*:", RegexOptions.IgnoreCase);
+        static readonly Regex LogPrefix = new Regex(@"^\[\s*\w+\s*\]\s*\$?\s*");   // "[ error ] $"
+        const string ProcessedScripts = "/stage3/processed-scripts/";               // Luna's copy of the project scripts.
 
         static Dictionary<string, string> texts;
 
@@ -126,6 +132,38 @@ namespace Supercent.Util.Editor
                 },
             },
         };
+
+        // Collect, for a build the plugin reported as failed: its build task can end before it has published the
+        // new Project Diagnostics and flushed luna.log, so read them only once a new report has stopped changing.
+        public static async Task<BuildReport> CollectAfterBuild(string action, bool upload, bool failed, string reportIdBefore)
+        {
+            if (failed)
+            {
+                double until = EditorApplication.timeSinceStartup + SettleTimeout;
+                string last = null;
+                while (EditorApplication.timeSinceStartup < until)
+                {
+                    string id = CurrentReportId();
+                    if (id != null && id != reportIdBefore && id == last && !SafeIsBuilding())
+                        break;
+                    last = id;
+                    await Task.Delay(SettlePollMs);
+                }
+            }
+            return Collect(action, upload, failed, reportIdBefore);
+        }
+
+        static bool SafeIsBuilding()
+        {
+            try
+            {
+                return LunaPluginBridge.IsAvailable && LunaPluginBridge.IsBuilding;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
 
         // Errors and warnings of the build that just ran. failed: the plugin reported the build as failed;
         // a build is also failed when the report holds an error.
@@ -295,23 +333,26 @@ namespace Supercent.Util.Editor
                 return issues;
             }
 
+            var compiler = new List<BuildIssue>();
             foreach (string raw in lines)
             {
-                string line = raw.Trim();
-                if (line.Length == 0 || !ErrorWord.IsMatch(line) || NoErrors.IsMatch(line))
+                string line = LogPrefix.Replace(raw.Trim(), string.Empty).Trim();
+                if (line.Length == 0 || !ErrorWord.IsMatch(raw) || NoErrors.IsMatch(line) || CompilerWarning.IsMatch(line))
                     continue;
                 Match m = CompilerError.Match(line);
-                issues.Add(m.Success
-                    ? new BuildIssue
+                if (m.Success)
+                    compiler.Add(new BuildIssue
                     {
                         Message = m.Groups["msg"].Value.Trim(),
                         Code = m.Groups["code"].Value,
                         File = ProjectPath(m.Groups["file"].Value.Trim()),
                         Line = int.Parse(m.Groups["line"].Value),
-                    }
-                    : new BuildIssue { Message = line });
+                    });
+                else
+                    issues.Add(new BuildIssue { Message = line });
             }
-            return Distinct(issues).Take(MaxLogErrors).ToList();
+            // Compiler errors are the cause; the rest is MSBuild's summary of them and unrelated noise.
+            return Distinct(compiler.Count > 0 ? compiler : issues).Take(MaxLogErrors).ToList();
         }
 
         // "D:/…/Project/Assets/X.cs" or "Assets\X.cs" -> "Assets/X.cs"; anything else unchanged.
@@ -321,7 +362,10 @@ namespace Supercent.Util.Editor
                 return null;
             string p = path.Trim().Replace('\\', '/');
             string root = ProjectRoot.Replace('\\', '/').TrimEnd('/') + "/";
-            if (p.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+            int processed = p.IndexOf(ProcessedScripts, StringComparison.OrdinalIgnoreCase);
+            if (processed >= 0)
+                p = p.Substring(processed + ProcessedScripts.Length);
+            else if (p.StartsWith(root, StringComparison.OrdinalIgnoreCase))
                 p = p.Substring(root.Length);
             return p;
         }

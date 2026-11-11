@@ -42,6 +42,8 @@ namespace Supercent.Util.Editor
                     GUILayout.Label(AssistantUI.Icon("console.erroricon.sml"), GUILayout.Width(18), GUILayout.Height(18));
                     GUILayout.Label(report.Summary, EditorStyles.boldLabel);
                     GUILayout.FlexibleSpace();
+                    if (report.Errors.Count > 0 && GUILayout.Button(new GUIContent("Copy", "Copy the errors as text"), EditorStyles.miniButton, GUILayout.Width(44)))
+                        EditorGUIUtility.systemCopyBuffer = ErrorsText(report);
                     if (report.LogPath != null && GUILayout.Button(new GUIContent("luna.log", "The full log of the Luna build"), EditorStyles.miniButton, GUILayout.Width(64)))
                         EditorUtility.OpenWithDefaultApp(report.LogPath);
                     if (GUILayout.Button(new GUIContent("×", "Dismiss"), EditorStyles.miniButton, GUILayout.Width(22)))
@@ -123,6 +125,12 @@ namespace Supercent.Util.Editor
             }
             EditorGUILayout.Space(6);
         }
+
+        static string ErrorsText(BuildReport report) =>
+            report.Summary + "\n" + string.Join("\n", report.Errors.Select(e =>
+                "- " + (string.IsNullOrEmpty(e.Code) ? string.Empty : e.Code + " ") + e.Message +
+                (string.IsNullOrEmpty(e.Location) ? string.Empty : " (" + e.Location + ")") +
+                (string.IsNullOrEmpty(e.Details) ? string.Empty : "\n  " + e.Details.Replace("\n", "\n  "))));
 
         static string Clip(string text)
         {

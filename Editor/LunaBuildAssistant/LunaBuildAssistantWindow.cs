@@ -743,9 +743,17 @@ namespace Supercent.Util.Editor
                 LunaCacheCleaner.ClearBuildCache();
                 string reportBefore = BuildDiagnostics.CurrentReportId();
                 bool built = await LunaPluginBridge.BuildDevelop();
-                report = BuildDiagnostics.Collect(action, false, !built, reportBefore);
                 if (!built)
+                {
+                    status = "Build Develop failed. Reading the plugin's errors…";
+                    Repaint();
+                }
+                report = await BuildDiagnostics.CollectAfterBuild(action, false, !built, reportBefore);
+                if (!built)
+                {
+                    status = null;
                     return;
+                }
                 ProjectBuildState.MarkPrivateBuilt();
                 status = "Build Develop finished at " + DateTime.Now.ToString("HH:mm") + ".";
                 changesCheckedAt = 0;
