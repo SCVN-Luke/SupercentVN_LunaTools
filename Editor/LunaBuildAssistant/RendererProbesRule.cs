@@ -15,7 +15,7 @@ namespace Supercent.Util.Editor
     // Light Probes is not Off (engine: synchronizeWithEntity -> Renderer.UpdateProbes). Stacked items, characters
     // and anything that moves pay for it every frame. When the playable has no Light Probe Group, Reflection Probe
     // or baked lighting, Off renders the same (ambient light and skybox reflection, in Unity too).
-    public sealed class RendererProbesRule : ILunaLintFixable
+    public sealed class RendererProbesRule : ILunaLintFixable, ILunaLintHint
     {
         static readonly Regex ProbeObjects = new Regex(@"^--- !u!(220|215) ", RegexOptions.Multiline);     // LightProbeGroup, ReflectionProbe
         static readonly Regex LightingData = new Regex(@"m_LightingDataAsset: \{fileID: [1-9]");
@@ -133,7 +133,7 @@ namespace Supercent.Util.Editor
 
         // Scenes Luna builds (the plugin's list, else the Build Settings), with generated _NoPrefab copies mapped back
         // to their source scene: the copies are regenerated from the source and its prefabs before every build.
-        static List<string> BuildScenes()
+        internal static List<string> BuildScenes()
         {
             List<string> scenes;
             try
@@ -151,7 +151,7 @@ namespace Supercent.Util.Editor
         }
 
         // Luna also exports everything under Resources.
-        static IEnumerable<string> ResourcesPrefabs() =>
+        internal static IEnumerable<string> ResourcesPrefabs() =>
             AssetDatabase.FindAssets("t:Prefab", new[] { "Assets" })
                 .Select(AssetDatabase.GUIDToAssetPath)
                 .Where(p => p.IndexOf("/Resources/", StringComparison.OrdinalIgnoreCase) >= 0);
@@ -179,7 +179,7 @@ namespace Supercent.Util.Editor
         }
 
         // Git submodules inside Assets (shared code and art): left to their own repositories.
-        static string[] SharedFolders()
+        internal static string[] SharedFolders()
         {
             string project = Directory.GetParent(Application.dataPath).FullName.Replace('\\', '/');
             for (string dir = project; dir != null; dir = Path.GetDirectoryName(dir)?.Replace('\\', '/'))
@@ -198,7 +198,7 @@ namespace Supercent.Util.Editor
             return new string[0];
         }
 
-        static bool Owned(string path, string[] shared) =>
+        internal static bool Owned(string path, string[] shared) =>
             path.StartsWith("Assets/", StringComparison.Ordinal) && !shared.Any(s => path.StartsWith(s, StringComparison.Ordinal));
 
         // Inner and base prefabs first, so an outer prefab sees them already fixed and gets no redundant override.

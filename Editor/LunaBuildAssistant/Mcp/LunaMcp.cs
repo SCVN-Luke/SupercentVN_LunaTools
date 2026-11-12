@@ -381,7 +381,8 @@ namespace Supercent.Util.Editor
             {
                 Name = "unity_luna_checks",
                 Description = "The Build Assistant's checks: code Luna will strip although running code still calls it (from Build Develop " +
-                              "runtime analysis), and known places where Luna behaves differently from Unity (each with its fix).",
+                              "runtime analysis), and known places where Luna behaves differently from Unity (each with its fix; level hint = " +
+                              "only matters on some playables, not counted as an upload warning).",
                 ReadOnly = true,
                 InputSchema = McpServer.Schema(),
                 Run = args => McpServer.ToolResult.Json(OnMainThread(() =>
@@ -392,7 +393,7 @@ namespace Supercent.Util.Editor
                     {
                         { "lunaChecks", lint.Rules.Select(r => (object)new Dictionary<string, object>
                             {
-                                { "id", r.Id }, { "title", r.Title }, { "fix", r.Fix },
+                                { "id", r.Id }, { "level", LunaLint.IsHint(r) ? "hint" : "warning" }, { "title", r.Title }, { "fix", r.Fix },
                                 { "issues", lint.Issues.Where(i => i.RuleId == r.Id).Take(30).Select(i => (object)i.Message).ToList() },
                             }).ToList() },
                         { "strippedButCalled", stripped == null ? null : stripped.Referenced.Take(40).Select(f => (object)new Dictionary<string, object>

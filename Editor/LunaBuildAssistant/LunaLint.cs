@@ -21,6 +21,12 @@ namespace Supercent.Util.Editor
         IEnumerable<LunaLint.Issue> Run();
     }
 
+    // A rule whose issues are worth a look but are not bugs on every playable (look or performance differences).
+    // Hints are listed after the warnings, collapsed, and are not counted in the Checks badge or the upload warnings.
+    public interface ILunaLintHint : ILunaLintRule
+    {
+    }
+
     // A rule whose issues the Assistant can fix in place (Checks page: "Fix all").
     public interface ILunaLintFixable : ILunaLintRule
     {
@@ -40,6 +46,7 @@ namespace Supercent.Util.Editor
             public string AssetPath;                        // Asset to open, or null when Type is set.
             public Type Type;
             public string Member;
+            public bool Hint;                               // Set by the runner from the rule (ILunaLintHint).
             public string Key => RuleId + "|" + (AssetPath ?? (Type == null ? string.Empty : ProjectCode.ClassName(Type))) + "|" + Member + "|" + Message;
 
             public void Open()
@@ -61,7 +68,13 @@ namespace Supercent.Util.Editor
             public readonly List<Issue> Issues = new List<Issue>();
             public readonly List<string> RuleErrors = new List<string>();
             public int Ignored;
+
+            public IEnumerable<Issue> Warnings => Issues.Where(i => !i.Hint);
+            public int WarningCount => Issues.Count(i => !i.Hint);
+            public int HintCount => Issues.Count(i => i.Hint);
         }
+
+        public static bool IsHint(ILunaLintRule rule) => rule is ILunaLintHint;
 
         static string IgnorePath => Path.Combine(Directory.GetParent(Application.dataPath).FullName, IgnoreFile);
 
@@ -79,6 +92,7 @@ namespace Supercent.Util.Editor
                     foreach (Issue issue in rule.Run())
                     {
                         issue.RuleId = rule.Id;
+                        issue.Hint = IsHint(rule);
                         if (ignored.Contains(issue.Key))
                             result.Ignored++;
                         else
@@ -299,11 +313,12 @@ namespace Supercent.Util.Editor
     // Luna's LimitVelocityOverLifetime.applyDamp does speed = lerp(speed, limit, dampen) once per simulated frame,
     // without dt. Unity applies dampen per 1/30 s of game time. So on Luna the excess speed dies 2x faster at 60 fps
     // (4x at 120 Hz), and during slow motion / hit stop (small Time.timeScale) it still dies every frame while the
-    // particles barely move: bursts and debris look much weaker than in the Editor (DragonBurst support shards).
-    public sealed class LimitVelocityDampenRule : ILunaLintRule
+    // particles barely move: bursts and debris look weaker than in the Editor (DragonBurst support shards).
+    // A hint: light damping often looks the same, so only effects that must carry far need the fix.
+    public sealed class LimitVelocityDampenRule : ILunaLintHint
     {
         static readonly Regex Block = new Regex(@"^--- !u!(?<class>\d+) &(?<id>-?\d+)[^\n]*\n(?<body>(?:(?!^--- ).*\n?)*)", RegexOptions.Multiline);
-        static readonly Regex Module = new Regex(@"^  ClampVelocityModule:\n    enabled: (?<enabled>\d)(?:\n    .*|\n      .*)*?\n    dampen: (?<dampen>[-\d.eE]+)", RegexOptions.Multiline);
+        static readonly Regex Module = new Regex(@"^  ClampVelocityModule:\n    enabled: (?<enabled>\d)(?:\n    .*)*?\n    dampen: (?<dampen>[-\d.eE]+)", RegexOptions.Multiline);
         static readonly Regex OverrideDampen = new Regex(@"propertyPath: ClampVelocityModule\.dampen\n\s*value: (?<dampen>[-\d.eE]+)");
         static readonly Regex GameObjectRef = new Regex(@"m_GameObject: \{fileID: (?<id>-?\d+)\}");
         static readonly Regex Name = new Regex(@"^\s*m_Name: (?<name>.*)$", RegexOptions.Multiline);
@@ -314,23 +329,39 @@ namespace Supercent.Util.Editor
         public string Title => "Particle Limit Velocity with Dampen between 0 and 1";
         public string Fix => "Luna applies Limit Velocity Dampen once per frame, not per time like Unity (per 1/30 s): particles lose their " +
                              "speed 2x faster at 60 fps, 4x at 120 Hz, and keep losing it every frame during slow motion or hit stop. " +
-                             "Use Dampen 1 with a Speed curve over lifetime (high at the start, falling to the old limit): both engines then " +
-                             "clamp to the same curve, independent of frame rate and time scale. Dampen 0 (no limit effect) is also safe.";
+                             "Only matters where the effect must carry far or plays in slow motion. Fix: Dampen 1 with a Speed curve over " +
+                             "lifetime (high at the start, falling to the old limit): both engines then clamp to the same curve, independent " +
+                             "of frame rate and time scale. Dampen 0 (no limit effect) is also safe.";
 
+        // Prefabs and scenes the build ships (build scenes, Resources), outside shared submodules: one issue per file.
         public IEnumerable<LunaLint.Issue> Run()
         {
-            string root = Directory.GetParent(Application.dataPath).FullName;
-            foreach (string file in StrippedCodeCheck.AssetFiles(new[] { "*.unity", "*.prefab" }))
+            List<string> scenes = RendererProbesRule.BuildScenes();
+            if (scenes.Count == 0)
+                yield break;
+            string[] shared = RendererProbesRule.SharedFolders();
+            string[] shipped = AssetDatabase.GetDependencies(scenes.Concat(RendererProbesRule.ResourcesPrefabs()).ToArray(), true);
+            foreach (string path in shipped.Where(p => (p.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase) || p.EndsWith(".unity", StringComparison.OrdinalIgnoreCase))
+                                                       && RendererProbesRule.Owned(p, shared)).OrderBy(p => p))
             {
-                string text = File.ReadAllText(file);
+                string text;
+                try
+                {
+                    text = File.ReadAllText(path);
+                }
+                catch (IOException)
+                {
+                    continue;
+                }
                 bool hasModule = text.Contains("ClampVelocityModule:");
                 bool hasOverride = text.Contains("ClampVelocityModule.dampen");
                 if (!hasModule && !hasOverride)
                     continue;
-                string path = file.Substring(root.Length + 1).Replace('\\', '/');
 
-                Dictionary<string, string> names = null;
+                var found = new List<string>();
                 if (hasModule)
+                {
+                    Dictionary<string, string> names = null;
                     foreach (Match block in Block.Matches(text))
                     {
                         if (block.Groups["class"].Value != ParticleSystemClassId)
@@ -342,17 +373,19 @@ namespace Supercent.Util.Editor
                             .Where(b => b.Groups["class"].Value == GameObjectClassId)
                             .ToDictionary(b => b.Groups["id"].Value, b => Name.Match(b.Groups["body"].Value).Groups["name"].Value.Trim());
                         string goId = GameObjectRef.Match(block.Groups["body"].Value).Groups["id"].Value;
-                        yield return new LunaLint.Issue
-                        {
-                            AssetPath = path,
-                            Message = $"{path}: {(names.TryGetValue(goId, out string go) ? go : "ParticleSystem")} dampen {dampen}",
-                        };
+                        found.Add($"{(names.TryGetValue(goId, out string go) ? go : "ParticleSystem")} {dampen}");
                     }
-
+                }
                 if (hasOverride)
                     foreach (Match o in OverrideDampen.Matches(text))
                         if (IsPartial(o.Groups["dampen"].Value, out float dampen))
-                            yield return new LunaLint.Issue { AssetPath = path, Message = $"{path}: prefab override dampen {dampen}" };
+                            found.Add($"override {dampen}");
+                if (found.Count > 0)
+                    yield return new LunaLint.Issue
+                    {
+                        AssetPath = path,
+                        Message = $"{path}: dampen {string.Join(", ", found)}",
+                    };
             }
         }
 

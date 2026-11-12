@@ -17,20 +17,24 @@ namespace Supercent.Util.Editor
             "Luna strips every method that never ran in Build Develop. Listed here: methods newly stripped since the " +
             "last upload that running code still calls, usually from a branch nobody tested.\n\n" +
             "Play that path in Build Develop, Keep it (never stripped), or mark it Strip OK.";
-        const string LintHelp = "Code and scene patterns that behave differently on Luna than in Unity.";
+        const string LintHelp = "Code and scene patterns that behave differently on Luna than in Unity.\n\n" +
+                                "Hints (collapsed, listed last) are differences that only matter on some playables; " +
+                                "they are not counted in the badge or the upload warnings.";
 
         StrippedCodeCheck.Report stripped;
         LunaLint.Result lint;
         bool strippedStale = true, lintStale = true;
         DateTime checkedLunaJsonTime;
         bool showUnreferenced;
+        readonly HashSet<string> expandedHints = new HashSet<string>();     // Hint rules the user opened (collapsed by default).
         Vector2 scroll;
 
         public int Tab;                                 // 0 = stripped code, 1 = Luna checks.
         public Action<Exception> OnError;
 
         public int StrippedRiskCount => stripped?.Referenced.Count ?? 0;
-        public int LintIssueCount => lint?.Issues.Count ?? 0;
+        public int LintIssueCount => lint?.WarningCount ?? 0;     // Warnings only: hints never count.
+        public int LintHintCount => lint?.HintCount ?? 0;
         public int IssueCount => StrippedRiskCount + LintIssueCount;
 
         public void Invalidate()
@@ -68,12 +72,13 @@ namespace Supercent.Util.Editor
             if (StrippedRiskCount > 0)
                 lines.Add($"{StrippedRiskCount} stripped method(s) still called by running code (e.g. {stripped.Referenced[0].ShortLabel}).");
             if (LintIssueCount > 0)
-                lines.Add($"{LintIssueCount} Luna check issue(s) (e.g. {lint.Issues[0].Message}).");
+                lines.Add($"{LintIssueCount} Luna check issue(s) (e.g. {lint.Warnings.First().Message}).");
             return lines;
         }
 
         public string StrippedSummary => stripped == null ? "Checking…" : StrippedRiskCount == 0 ? "Nothing new is missing" : $"{StrippedRiskCount} still called";
-        public string LintSummary => lint == null ? "Checking…" : LintIssueCount == 0 ? "No known issue" : $"{LintIssueCount} issue(s)";
+        public string LintSummary => lint == null ? "Checking…"
+            : (LintIssueCount == 0 ? "No known issue" : $"{LintIssueCount} issue(s)") + (LintHintCount > 0 ? $", {LintHintCount} hint(s)" : string.Empty);
 
         public void Draw()
         {
@@ -182,13 +187,33 @@ namespace Supercent.Util.Editor
                 EditorGUILayout.HelpBox("Rule failed: " + error, MessageType.Error);
             EditorGUILayout.Space(4);
 
-            foreach (ILunaLintRule rule in lint.Rules.OrderByDescending(r => lint.Issues.Count(i => i.RuleId == r.Id)))
+            // Warnings first (most issues first), then hints.
+            foreach (ILunaLintRule rule in lint.Rules.OrderBy(LunaLint.IsHint).ThenByDescending(r => lint.Issues.Count(i => i.RuleId == r.Id)))
             {
                 List<LunaLint.Issue> issues = lint.Issues.Where(i => i.RuleId == rule.Id).ToList();
+                bool hint = LunaLint.IsHint(rule);
+                bool expanded = !hint || expandedHints.Contains(rule.Id);
                 using (new EditorGUILayout.HorizontalScope())
                 {
-                    GUILayout.Label(AssistantUI.StatusIcon(issues.Count == 0), GUILayout.Width(18), GUILayout.Height(18));
-                    GUILayout.Label(new GUIContent(rule.Title, rule.Fix), EditorStyles.boldLabel);
+                    GUILayout.Label(hint && issues.Count > 0 ? AssistantUI.Icon("console.infoicon.sml", "Hint: worth a look, not a bug on every playable")
+                        : AssistantUI.StatusIcon(issues.Count == 0), GUILayout.Width(18), GUILayout.Height(18));
+                    if (hint && issues.Count > 0)
+                    {
+                        var title = new GUIContent(rule.Title, rule.Fix);
+                        Rect rect = GUILayoutUtility.GetRect(title, AssistantUI.CaptionFoldout,
+                            GUILayout.Width(AssistantUI.CaptionFoldout.CalcSize(title).x + 4));     // Width of the text, so the help icon follows it.
+                        bool open = EditorGUI.Foldout(rect, expanded, title, true, AssistantUI.CaptionFoldout);
+                        if (open != expanded)
+                        {
+                            if (open)
+                                expandedHints.Add(rule.Id);
+                            else
+                                expandedHints.Remove(rule.Id);
+                            expanded = open;
+                        }
+                    }
+                    else
+                        GUILayout.Label(new GUIContent(rule.Title, rule.Fix), hint ? AssistantUI.Caption : EditorStyles.boldLabel);
                     GUILayout.Label(AssistantUI.Icon("_Help", rule.Id + "\n\n" + rule.Fix), GUILayout.Width(18), GUILayout.Height(18));
                     GUILayout.FlexibleSpace();
                     if (issues.Count > 0 && rule is ILunaLintFixable fixable
@@ -206,9 +231,9 @@ namespace Supercent.Util.Editor
                         lintStale = true;
                         GUIUtility.ExitGUI();
                     }
-                    GUILayout.Label(issues.Count == 0 ? "OK" : issues.Count.ToString(), AssistantUI.Caption);
+                    GUILayout.Label(issues.Count == 0 ? "OK" : hint ? $"Hint · {issues.Count}" : issues.Count.ToString(), AssistantUI.Caption);
                 }
-                for (int i = 0; i < issues.Count; i++)
+                for (int i = 0; expanded && i < issues.Count; i++)
                 {
                     LunaLint.Issue issue = issues[i];
                     using (AssistantUI.Row(i))
