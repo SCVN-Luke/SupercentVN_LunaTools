@@ -295,4 +295,69 @@ namespace Supercent.Util.Editor
             return count;
         }
     }
+
+    // Luna's LimitVelocityOverLifetime.applyDamp does speed = lerp(speed, limit, dampen) once per simulated frame,
+    // without dt. Unity applies dampen per 1/30 s of game time. So on Luna the excess speed dies 2x faster at 60 fps
+    // (4x at 120 Hz), and during slow motion / hit stop (small Time.timeScale) it still dies every frame while the
+    // particles barely move: bursts and debris look much weaker than in the Editor (DragonBurst support shards).
+    public sealed class LimitVelocityDampenRule : ILunaLintRule
+    {
+        static readonly Regex Block = new Regex(@"^--- !u!(?<class>\d+) &(?<id>-?\d+)[^\n]*\n(?<body>(?:(?!^--- ).*\n?)*)", RegexOptions.Multiline);
+        static readonly Regex Module = new Regex(@"^  ClampVelocityModule:\n    enabled: (?<enabled>\d)(?:\n    .*|\n      .*)*?\n    dampen: (?<dampen>[-\d.eE]+)", RegexOptions.Multiline);
+        static readonly Regex OverrideDampen = new Regex(@"propertyPath: ClampVelocityModule\.dampen\n\s*value: (?<dampen>[-\d.eE]+)");
+        static readonly Regex GameObjectRef = new Regex(@"m_GameObject: \{fileID: (?<id>-?\d+)\}");
+        static readonly Regex Name = new Regex(@"^\s*m_Name: (?<name>.*)$", RegexOptions.Multiline);
+        const string ParticleSystemClassId = "198";
+        const string GameObjectClassId = "1";
+
+        public string Id => "LUNA006";
+        public string Title => "Particle Limit Velocity with Dampen between 0 and 1";
+        public string Fix => "Luna applies Limit Velocity Dampen once per frame, not per time like Unity (per 1/30 s): particles lose their " +
+                             "speed 2x faster at 60 fps, 4x at 120 Hz, and keep losing it every frame during slow motion or hit stop. " +
+                             "Use Dampen 1 with a Speed curve over lifetime (high at the start, falling to the old limit): both engines then " +
+                             "clamp to the same curve, independent of frame rate and time scale. Dampen 0 (no limit effect) is also safe.";
+
+        public IEnumerable<LunaLint.Issue> Run()
+        {
+            string root = Directory.GetParent(Application.dataPath).FullName;
+            foreach (string file in StrippedCodeCheck.AssetFiles(new[] { "*.unity", "*.prefab" }))
+            {
+                string text = File.ReadAllText(file);
+                bool hasModule = text.Contains("ClampVelocityModule:");
+                bool hasOverride = text.Contains("ClampVelocityModule.dampen");
+                if (!hasModule && !hasOverride)
+                    continue;
+                string path = file.Substring(root.Length + 1).Replace('\\', '/');
+
+                Dictionary<string, string> names = null;
+                if (hasModule)
+                    foreach (Match block in Block.Matches(text))
+                    {
+                        if (block.Groups["class"].Value != ParticleSystemClassId)
+                            continue;
+                        Match module = Module.Match(block.Groups["body"].Value);
+                        if (!module.Success || module.Groups["enabled"].Value != "1" || !IsPartial(module.Groups["dampen"].Value, out float dampen))
+                            continue;
+                        names ??= Block.Matches(text).Cast<Match>()
+                            .Where(b => b.Groups["class"].Value == GameObjectClassId)
+                            .ToDictionary(b => b.Groups["id"].Value, b => Name.Match(b.Groups["body"].Value).Groups["name"].Value.Trim());
+                        string goId = GameObjectRef.Match(block.Groups["body"].Value).Groups["id"].Value;
+                        yield return new LunaLint.Issue
+                        {
+                            AssetPath = path,
+                            Message = $"{path}: {(names.TryGetValue(goId, out string go) ? go : "ParticleSystem")} dampen {dampen}",
+                        };
+                    }
+
+                if (hasOverride)
+                    foreach (Match o in OverrideDampen.Matches(text))
+                        if (IsPartial(o.Groups["dampen"].Value, out float dampen))
+                            yield return new LunaLint.Issue { AssetPath = path, Message = $"{path}: prefab override dampen {dampen}" };
+            }
+        }
+
+        static bool IsPartial(string value, out float dampen) =>
+            float.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out dampen)
+            && dampen > 0f && dampen < 1f;
+    }
 }
