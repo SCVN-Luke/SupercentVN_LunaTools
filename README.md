@@ -38,6 +38,35 @@ restart, activate a GameObject by name (end card). The phone URL is shown in the
   methods, project code only by default or grouped by class.
 - Errors: console errors and warnings deduplicated with counts, stack frames mapped back to the C#
   method (from the `/*Class.Method start.*/` markers in Luna's compiled scripts); Copy all as text.
+- Replay: input presets for testing ("full flow - win", "timeout - lose", ...). ● Record reloads the
+  playable and records it from its first frame; ■ Stop & save writes `LunaRecordings/<name>.json` in
+  the project (outside `Assets`, never shipped; commit it to share) with an expected-result label and the
+  end check (default: the end card object's active state at the stop). ▶ replays one (Fast / ×1 / ×2 / ×4)
+  and shows PASS / FAIL, the checks, where it first differs from the recording, and errors.
+
+### How a replay stays exact
+
+Recording and replay both start from a fresh load (armed in `sessionStorage`, then reload) and take
+over before Luna runs:
+
+- Engine loop: `Application.start()` runs tick 0, then each tick asks
+  `requestAnimationFrame(app.tick)`. A recording notes every tick's raw delta; a replay keeps those
+  requests and runs each tick itself with the recorded delta, as fast or slow as asked (`MessageChannel`
+  slices, so a hidden tab is not throttled).
+- Clock: in these loads `performance.now` / `Date` are virtual. They stand still during a tick and move
+  by the tick's delta, in multiples of 1/1024 ms so every sum is exact: `Time.deltaTime`,
+  `realtimeSinceStartup`, `DateTime` and the engine's clamp come out bit for bit the same.
+- Input: real mouse / touch / key events (and `luna_simulate`'s) are noted with the tick they precede, at
+  full precision, and replayed as the same DOM events (canvas; keys on the engine keyboard's element).
+  Real input is ignored while a replay runs.
+- `Math.random` is seeded (seed stored); the page's Playground values (`window.playgroundOverrides`)
+  are recorded and forced on replay unless turned off; the viewport is recorded and the Dev
+  Environment's iframe is set to it.
+- Every 30 ticks a sample (main camera position, active objects, draw calls) is stored; a replay
+  compares them and reports the first difference, and the final state (`identical`).
+
+Still outside it: audio playback (real time), and code seeded from anything else. Re-record a preset
+after gameplay changes. During these loads the engine's own frame timings read 0 (frozen clock).
 
 It cannot change a build: nothing is written to the build output (the size estimate reads the same
 files), the script sits in an Editor folder Luna never exports, call counts come from the `TRACE`
@@ -122,6 +151,11 @@ across reloads; tools default to the most recently loaded page.
   (who assigns a field, with C# stack), `luna_screenshot`, `luna_reload` (fresh start, waits for the
   engine), `luna_simulate` (touch / drag steps played frame by frame with a fixed delta, through the
   engine's input; same result in a hidden tab), `luna_control` (pause / step / speed / restart), `luna_eval`.
+- Recordings: `luna_recordings` (presets in `LunaRecordings/`, no page needed), `luna_replay` (reloads,
+  replays tick by tick, returns passed, checks, first difference, final state, errors and screenshots at
+  asked play times; `speed`, `stopAtSeconds`, `applyConfig`, `matchViewport`), `luna_record` (start /
+  stop / cancel / status: records the user's play or `luna_simulate` steps). The proxy serves the files at
+  `/__luna_devtools/recordings` (save from any page, delete from this machine only).
 - Editor: `unity_compile` (imports changed scripts, C# errors with file:line), `unity_build_develop`
   (starts the build and returns; poll `unity_build_report`, which keeps the result across a Unity
   reload), `unity_luna_checks`, `unity_find_source` (C# name → file:line + code), `unity_open_source`.

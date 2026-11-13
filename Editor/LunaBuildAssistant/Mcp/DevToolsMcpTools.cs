@@ -18,6 +18,10 @@ namespace Supercent.Util.Editor
             "failed while Luna started (Luna hides those; the class keeps null statics). unity_find_source turns a C# name into file:line.\n" +
             "- Reproduce: luna_reload for a fresh start, luna_simulate to play touch / drag steps frame by frame (works in hidden tabs), " +
             "then luna_get_errors / luna_screenshot.\n" +
+            "- Test with recorded plays: luna_recordings lists the input presets saved in the project (e.g. 'full flow - win'); luna_replay " +
+            "replays one from a fresh start tick by tick (same deltas, seeded random, recorded Playground values) and returns pass / fail of " +
+            "its end checks, where it starts to differ from the recording, errors and screenshots. luna_record records a new one (the user " +
+            "plays, or luna_simulate steps).\n" +
             "- Performance: luna_get_stats (frame time, draw calls, heap), luna_record_hot_paths (cost per script callback / coroutine and the " +
             "methods called inside, while the game is played), luna_capture_frame (draw calls of one frame).\n" +
             "- State: luna_find_objects / luna_get_object read the scene; luna_watch_field records who changes a field (with C# stack).\n" +
@@ -184,6 +188,8 @@ namespace Supercent.Util.Editor
                 },
             });
 
+            RegisterRecordings(server, channel, session);
+
             Page(server, channel, "luna_control", "control", 10000, false,
                 "Changes the page: pause / resume / step one frame / speed (engine time scale x0.25-x8) / restart (reload). Pausing and speed " +
                 "use the engine's own pause and time scale and are undone by resume and speed 1.",
@@ -248,6 +254,150 @@ namespace Supercent.Util.Editor
                     { "session", session },
                     { "code", McpServer.Prop("string", "Function body; use 'return' for the result") },
                 }, "code"));
+        }
+
+        // Input recordings: files in <project>/LunaRecordings (LunaRecordings), recorded and replayed by the page.
+        static void RegisterRecordings(McpServer server, DevToolsChannel channel, Dictionary<string, object> session)
+        {
+            server.Register(new McpServer.Tool
+            {
+                Name = "luna_recordings",
+                Description = "Input recordings saved in the project (LunaRecordings/*.json, recorded in the Dev Tools' Replay tab or with " +
+                              "luna_record): name, expected outcome, length, input kind, end checks. Replay one with luna_replay. No page needed.",
+                ReadOnly = true,
+                InputSchema = McpServer.Schema(),
+                Run = args => McpServer.ToolResult.Json(new Dictionary<string, object>
+                {
+                    { "folder", LunaRecordings.Dir },
+                    { "recordings", LunaRecordings.List() },
+                }),
+            });
+
+            server.Register(new McpServer.Tool
+            {
+                Name = "luna_replay",
+                Description = "Replays a saved recording in a Build Develop page from a fresh start: the page reloads, then every engine tick " +
+                              "runs with the recorded delta and the recorded mouse / touch / key events before it (Math.random seeded as " +
+                              "recorded, the recorded Playground values forced unless applyConfig=false, the Dev Environment's iframe set to the " +
+                              "recorded size). Returns passed (all end checks true), each check, where the state first differs from the " +
+                              "recording (camera / active objects, sampled every 0.5 s), errors logged and screenshots at the asked seconds. " +
+                              "Random code not driven by Math.random (e.g. DateTime seeds) can still make a replay differ. Runs game code like " +
+                              "real play; the user's own input is ignored while it runs.",
+                ReadOnly = false,
+                InputSchema = McpServer.Schema(new Dictionary<string, object>
+                {
+                    { "session", session },
+                    { "name", McpServer.Prop("string", "Recording name from luna_recordings") },
+                    { "speed", McpServer.Prop("number", "0 = as fast as the page can run (default), 1 = real time, 2 = twice as fast", 0) },
+                    { "screenshotsAt", new Dictionary<string, object>
+                        {
+                            { "type", "array" }, { "items", McpServer.Prop("number", "Seconds of play") },
+                            { "description", "Screenshots at these play times in seconds (a time past the end gives the last frame)" },
+                        } },
+                    { "screenshotAtEnd", McpServer.Prop("boolean", "Add a screenshot of the last frame", true) },
+                    { "maxWidth", McpServer.Prop("integer", "Screenshot width", 360) },
+                    { "stopAtSeconds", McpServer.Prop("number", "Stop the replay at this play time (no end checks then)") },
+                    { "applyConfig", McpServer.Prop("boolean", "Force the recording's Playground values (default true)", true) },
+                    { "matchViewport", McpServer.Prop("boolean", "Set the page's iframe to the recorded size first (default true)", true) },
+                    { "waitSeconds", McpServer.Prop("number", "How long to wait for the replay to end (after the reload)", 180) },
+                }, "name"),
+                Run = args =>
+                {
+                    string name = MiniJson.Str(args, "name");
+                    LunaRecordings.Read(name);       // Clear error here when the name is wrong.
+                    string id = channel.Resolve(MiniJson.Str(args, "session"));
+                    var shots = (args.TryGetValue("screenshotsAt", out object s) && s is List<object> list ? list : new List<object>()).ToList();
+                    if (MiniJson.Bool(args, "screenshotAtEnd", true))
+                        shots.Add(1e9);
+                    var start = new Dictionary<string, object>
+                    {
+                        { "name", name }, { "speed", MiniJson.Num(args, "speed", 0) }, { "screenshotsAt", shots },
+                        { "maxWidth", MiniJson.Num(args, "maxWidth", 360) }, { "applyConfig", MiniJson.Bool(args, "applyConfig", true) },
+                        { "matchViewport", MiniJson.Bool(args, "matchViewport", true) },
+                    };
+                    if (args.ContainsKey("stopAtSeconds"))
+                        start["stopAtSeconds"] = MiniJson.Num(args, "stopAtSeconds", 0);
+                    var armed = MiniJson.Obj(channel.Send(id, "replayStart", start, 15000));
+                    channel.WaitForLoad(id, MiniJson.Str(armed, "previousLoadId"), 90000);
+                    int waitMs = (int)(Math.Max(10, Math.Min(900, MiniJson.Num(args, "waitSeconds", 180))) * 1000);
+                    var result = MiniJson.Obj(channel.Send(id, "replayResult", new Dictionary<string, object> { { "timeoutMs", waitMs } }, waitMs + 10000));
+                    return WithScreenshots(result);
+                },
+            });
+
+            server.Register(new McpServer.Tool
+            {
+                Name = "luna_record",
+                Description = "Records an input preset for luna_replay. start: the page reloads and records every tick and input from its first " +
+                              "frame (the user plays, or drive it with luna_simulate). stop: saves it to LunaRecordings/<name>.json with the " +
+                              "expected outcome label and end checks (expectObject: a GameObject name whose active state at the stop is " +
+                              "expected at the end of every replay, e.g. the end card; checks: more {object|path, active} or {path, script, " +
+                              "field, equals}). cancel drops it; status shows its progress.",
+                ReadOnly = false,
+                InputSchema = McpServer.Schema(new Dictionary<string, object>
+                {
+                    { "session", session },
+                    { "action", McpServer.Prop("string", "What to do", null, new[] { "start", "stop", "cancel", "status" }) },
+                    { "name", McpServer.Prop("string", "Recording name for start, e.g. 'full flow - win'") },
+                    { "outcome", McpServer.Prop("string", "stop: expected result label, e.g. win / lose") },
+                    { "expectObject", McpServer.Prop("string", "stop: GameObject whose active state at the stop is checked at the end of replays") },
+                    { "checks", new Dictionary<string, object> { { "type", "array" }, { "description", "stop: more end checks" }, { "items", new Dictionary<string, object> { { "type", "object" } } } } },
+                }, "action"),
+                Run = args =>
+                {
+                    string action = MiniJson.Str(args, "action");
+                    string id = channel.Resolve(MiniJson.Str(args, "session"));
+                    switch (action)
+                    {
+                        case "start":
+                        {
+                            string name = MiniJson.Str(args, "name");
+                            LunaRecordings.FileName(name);      // Rejects an empty or unusable name before the reload.
+                            var armed = MiniJson.Obj(channel.Send(id, "recordStart", new Dictionary<string, object> { { "name", name } }, 15000));
+                            var info = channel.WaitForLoad(id, MiniJson.Str(armed, "previousLoadId"), 90000);
+                            return McpServer.ToolResult.Json(new Dictionary<string, object>
+                            {
+                                { "recording", name }, { "session", info.Id }, { "frame", info.Frame },
+                                { "file", LunaRecordings.FolderName + "/" + LunaRecordings.FileName(name) },
+                                { "hint", "Recording from the first frame. Play (or luna_simulate), then luna_record action=stop with outcome / expectObject." },
+                            });
+                        }
+                        case "stop":
+                            return McpServer.ToolResult.Json(channel.Send(id, "recordStop", new Dictionary<string, object>
+                            {
+                                { "outcome", MiniJson.Str(args, "outcome", "") }, { "expectObject", MiniJson.Str(args, "expectObject") },
+                                { "checks", args.TryGetValue("checks", out object checks) ? checks : null },
+                            }, 30000));
+                        case "cancel":
+                            return McpServer.ToolResult.Json(channel.Send(id, "recordStop", new Dictionary<string, object> { { "cancel", true } }, 10000));
+                        case "status":
+                            return McpServer.ToolResult.Json(channel.Send(id, "inputState", new Dictionary<string, object>(), 10000));
+                        default:
+                            return McpServer.ToolResult.Text("action: start, stop, cancel or status", true);
+                    }
+                },
+            });
+        }
+
+        // Replay result: screenshots become images, the JSON keeps where they were taken.
+        static McpServer.ToolResult WithScreenshots(Dictionary<string, object> result)
+        {
+            var images = new List<Dictionary<string, object>>();
+            if (result != null && result.TryGetValue("screenshots", out object s) && s is List<object> shots)
+            {
+                var where = new List<object>();
+                foreach (var shot in shots.Select(MiniJson.Obj).Where(x => x != null))
+                {
+                    double seconds = MiniJson.Num(shot, "seconds", 0);
+                    where.Add(new Dictionary<string, object> { { "seconds", seconds >= 1e8 ? "end" : (object)seconds }, { "tick", shot.TryGetValue("tick", out object t) ? t : null } });
+                    images.Add(shot);
+                }
+                result["screenshots"] = where;
+            }
+            var output = McpServer.ToolResult.Json(result);
+            foreach (var shot in images)
+                output.WithImage(MiniJson.Str(shot, "base64"), MiniJson.Str(shot, "mimeType", "image/jpeg"));
+            return output;
         }
 
         static void Page(McpServer server, DevToolsChannel channel, string name, string method, int timeoutMs, bool readOnly,

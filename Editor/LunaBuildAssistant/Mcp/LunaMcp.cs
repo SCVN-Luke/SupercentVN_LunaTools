@@ -39,6 +39,7 @@ namespace Supercent.Util.Editor
 
         static LunaMcp()
         {
+            LunaRecordings.Dir = Path.Combine(projectPath, LunaRecordings.FolderName);
             DevToolsMcpTools.Register(Server, Channel, EditorStatus);
             RegisterEditorTools();
             RegisterUploadTools();

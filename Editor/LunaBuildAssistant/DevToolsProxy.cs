@@ -41,6 +41,8 @@ namespace Supercent.Util.Editor
         public const string McpRoute = "/mcp";
         public const string ChannelRoute = "/__luna_devtools/channel";
         public const string ResultRoute = "/__luna_devtools/result";
+        // Input recordings (LunaRecordings): GET = list, GET ?name= = one file, POST {action: save|delete}.
+        public const string RecordingsRoute = "/__luna_devtools/recordings";
         const int MaxBodyBytes = 16 * 1024 * 1024;
         public McpServer Mcp { get; set; }
         public DevToolsChannel Channel { get; set; }
@@ -188,6 +190,8 @@ namespace Supercent.Util.Editor
                         ServeMcp(client, browser, method, head, rest);
                     else if (path == ChannelRoute || path == ResultRoute)
                         ServeChannel(browser, method, path, requestLine[1], head, rest);
+                    else if (path == RecordingsRoute)
+                        ServeRecordings(client, browser, method, requestLine[1], head, rest);
                     else if (method == "GET" && path.EndsWith("/iframe.html", StringComparison.OrdinalIgnoreCase))
                         ServeInjected(browser, head, "agent");
                     else if (method == "GET" && (path == "/" || path.Equals("/index.html", StringComparison.OrdinalIgnoreCase)))
@@ -433,6 +437,50 @@ namespace Supercent.Util.Editor
             string session = Query(target, "session");
             string reply = path == ChannelRoute ? channel.Poll(session, body) : channel.Results(session, body);
             Respond(browser, "200 OK", "application/json; charset=utf-8", Encoding.UTF8.GetBytes(reply));
+        }
+
+        // Recordings are saved from any page that reaches the proxy (a phone on the LAN too); deleting is for this machine.
+        void ServeRecordings(TcpClient client, Stream browser, string method, string target, string head, byte[] rest)
+        {
+            const string json = "application/json; charset=utf-8";
+            try
+            {
+                if (method == "GET")
+                {
+                    string name = Query(target, "name");
+                    string reply = name == null
+                        ? MiniJson.Write(new Dictionary<string, object> { { "folder", LunaRecordings.Dir }, { "recordings", LunaRecordings.List() } })
+                        : LunaRecordings.Read(name);
+                    Respond(browser, "200 OK", json, Encoding.UTF8.GetBytes(reply));
+                    return;
+                }
+                if (method != "POST")
+                {
+                    Respond(browser, "405 Method Not Allowed", json, Encoding.UTF8.GetBytes("{\"error\":\"GET or POST\"}"), "Allow: GET, POST\r\n");
+                    return;
+                }
+                var body = MiniJson.Obj(MiniJson.Parse(ReadBody(browser, head, rest))) ?? new Dictionary<string, object>();
+                object result;
+                switch (MiniJson.Str(body, "action"))
+                {
+                    case "save":
+                        result = new Dictionary<string, object> { { "file", LunaRecordings.Save(MiniJson.Obj(body.TryGetValue("recording", out object r) ? r : null)) } };
+                        break;
+                    case "delete":
+                        if (!IsLoopback(client))
+                            throw new UnauthorizedAccessException("Recordings are deleted from this machine only.");
+                        result = new Dictionary<string, object> { { "deleted", LunaRecordings.Delete(MiniJson.Str(body, "name")) } };
+                        break;
+                    default:
+                        throw new ArgumentException("action: save or delete");
+                }
+                Respond(browser, "200 OK", json, Encoding.UTF8.GetBytes(MiniJson.Write(result)));
+            }
+            catch (Exception e) when (!(e is IOException || e is SocketException))
+            {
+                string status = e is FileNotFoundException ? "404 Not Found" : e is UnauthorizedAccessException ? "403 Forbidden" : "400 Bad Request";
+                Respond(browser, status, json, Encoding.UTF8.GetBytes(MiniJson.Write(new Dictionary<string, object> { { "error", e.Message } })));
+            }
         }
 
         static string ReadBody(Stream stream, string head, byte[] rest)

@@ -27,6 +27,7 @@
 
     var realNow = performance.now.bind(performance);
     var nativeRaf = window.requestAnimationFrame.bind(window);
+    var nativeRandom = Math.random;     // Recordings seed Math.random; the Dev Tools' own ids keep the real one.
     var STORE = 'lunaDevTools.';
 
     function load(key, fallback) {
@@ -1126,7 +1127,7 @@
         // Reading commands use engine data (entities, components) and raw field values only: no C# method or property
         // getter runs, so Luna's runtime analysis is unchanged. control / eval are the exceptions and say so.
         var CHANNEL_ROUTE = '/__luna_devtools/channel', RESULT_ROUTE = '/__luna_devtools/result';
-        function newId() { return Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4); }
+        function newId() { return nativeRandom().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4); }
         // A tab keeps its session across reloads (sessionStorage), so an agent's session id stays valid; loadId tells
         // the loads apart. A duplicated tab copies sessionStorage: it asks the other tabs and takes a new id if taken.
         var SESSION_KEY = 'lunaDevTools.session';
@@ -1259,6 +1260,543 @@
 
         function stackHere() { return new Error().stack || ''; }
 
+        // JPEG of the canvas. redraw: draw the current state first (the buffer is only valid in the task that drew it).
+        function grab(maxWidth, redrawFirst) {
+            var canvas = agent.gl.canvas();
+            if (!canvas) throw new Error('No WebGL canvas yet.');
+            if (redrawFirst) redraw();
+            var w = Math.max(16, Math.min(maxWidth || 540, canvas.width)), h = Math.round(canvas.height * w / canvas.width);
+            var copy = win.document.createElement('canvas');
+            copy.width = w;
+            copy.height = h;
+            copy.getContext('2d').drawImage(canvas, 0, 0, w, h);
+            var url = copy.toDataURL('image/jpeg', 0.85), a = getApp();
+            return { base64: url.slice(url.indexOf(',') + 1), mimeType: 'image/jpeg', width: w, height: h, frame: a ? a.frame : 0 };
+        }
+
+        // ---------- Input recordings: record a play from the start, replay it tick by tick ----------
+        // Both start with a fresh load (armed in sessionStorage, then reload) and take over before Luna runs:
+        //   - the engine loop: Application.start() runs tick 0 itself, then every tick asks
+        //     window.requestAnimationFrame(app.tick). A recording notes each tick's raw delta (app._time before
+        //     and after, ms); a replay keeps the engine's own requests and runs every tick itself with that delta,
+        //     so Time.deltaTime, the 0.1 s clamp and the time scale come out the same, as fast or slow as asked;
+        //   - input: real mouse / touch / key events (and luna_simulate's) are noted with the tick they precede,
+        //     replayed as the same DOM events on the canvas (keys on the document) before that tick;
+        //   - Math.random is seeded (stored in the recording), Playground overrides are recorded and, by default,
+        //     forced on replay (window.playgroundOverrides, which Luna reads when it starts); the viewport is
+        //     recorded and the Dev Environment's iframe is set to it before a replay.
+        // A light state sample (camera position, active objects, draw calls) every SAMPLE_EVERY ticks tells where a
+        // replay starts to differ. Nothing here wraps game code: runtime analysis sees the game's own calls only.
+        var RECORDINGS_ROUTE = '/__luna_devtools/recordings', INPUT_ARM = 'lunaDevTools.inputArm', SAMPLE_EVERY = 30;
+        var inputs = (function () {
+            var arm = null;
+            try {
+                arm = JSON.parse(win.sessionStorage.getItem(INPUT_ARM) || 'null');
+                win.sessionStorage.removeItem(INPUT_ARM);
+            } catch (e) { arm = null; }
+            var mode = arm && (arm.mode === 'record' || arm.mode === 'replay') ? arm.mode : null;
+            var rec = null, rp = null, lastResult = null, waiters = [];
+            var engineRaf = win.requestAnimationFrame;
+
+            function r3(v) { return Math.round(v * 1000) / 1000; }
+
+            // Virtual clock (recording / replay loads only). The engine's delta, Time.realtimeSinceStartup, DateTime and
+            // any timer the game reads come from performance.now / Date: they stay still during a tick (the tick's time)
+            // and move only from tick to tick, by the recorded delta on replay. Times are multiples of 1/1024 ms, so the
+            // replay's sums and differences are exact and every Time.deltaTime matches the recording bit for bit.
+            // After a replay (ahead of the real clock) or a recording, the clock runs on from where it stopped (offset).
+            var perf = win.performance, realPerfNow = perf.now.bind(perf), RealDate = win.Date,
+                clock = { installed: false, frozen: null, offset: 0, t0: null, date0: null };
+            function q(v) { return Math.round(v * 1024) / 1024; }
+            function vNow() { return clock.frozen !== null ? clock.frozen : q(realPerfNow() + clock.offset); }
+            function unfreeze() {
+                if (clock.frozen === null) return;
+                clock.offset = clock.frozen - realPerfNow();
+                clock.frozen = null;
+            }
+            function vDateNow() { return clock.t0 === null ? RealDate.now() : clock.date0 + (vNow() - clock.t0); }
+            function installClock() {
+                clock.installed = true;
+                try { Object.defineProperty(perf, 'now', { configurable: true, writable: true, value: vNow }); } catch (e) { fail('virtual clock', e); }
+                var VDate = function Date() {
+                    if (!(this instanceof VDate)) return new RealDate(vDateNow()).toString();
+                    var args = Array.prototype.slice.call(arguments);
+                    return args.length ? new (Function.prototype.bind.apply(RealDate, [null].concat(args)))() : new RealDate(vDateNow());
+                };
+                VDate.prototype = RealDate.prototype;
+                VDate.now = vDateNow;
+                VDate.parse = RealDate.parse;
+                VDate.UTC = RealDate.UTC;
+                win.Date = VDate;
+            }
+            // When the engine has run its first tick (Application.start): the date the clock starts from.
+            function clockStart(a, date0) {
+                if (clock.t0 !== null) return;
+                clock.t0 = a._time;
+                clock.date0 = date0 !== undefined ? date0 : RealDate.now();
+            }
+
+            // Math.random → mulberry32 with the recording's seed (only in a recording / replay load).
+            function seedRandom(seed) {
+                var s = seed >>> 0;
+                win.Math.random = function () {
+                    s = (s + 0x6D2B79F5) >>> 0;
+                    var t = s;
+                    t = Math.imul(t ^ (t >>> 15), t | 1);
+                    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+                    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+                };
+            }
+
+            function currentApp() {
+                try {
+                    var A = win.pc && win.pc.Application;
+                    return (A && (A._currentApplication || (A.getApplication && A.getApplication()))) || null;
+                } catch (e) { return null; }
+            }
+
+            function canvasOf(a) { return (a && a.graphicsDevice && a.graphicsDevice.canvas) || agent.gl.canvas(); }
+
+            function viewport() { return { width: win.innerWidth, height: win.innerHeight, dpr: win.devicePixelRatio || 1 }; }
+
+            function isPanel(e) {
+                var t = e.target;
+                return !!(t && t.closest && t.closest('[data-luna-devtools]'));
+            }
+
+            // Engine-side state only (no C# getter runs): main camera position, active objects, draw calls.
+            function countActive(e) {
+                var n = e.enabled ? 1 : 0, list = children(e);
+                if (!e.enabled) return 0;
+                for (var i = 0; i < list.length; i++) n += countActive(list[i]);
+                return n;
+            }
+            function sample(a, k) {
+                var s = { k: k };
+                try {
+                    var cams = a.systems && a.systems.camera && a.systems.camera.cameras, cam = null;
+                    for (var i = 0; cams && i < cams.length && !cam; i++) if (cams[i] && cams[i].entity && cams[i].entity.enabled) cam = cams[i];
+                    var p = cam && cam.entity.getPosition();
+                    if (p) s.cam = [r3(p.x), r3(p.y), r3(p.z)];
+                } catch (e) { /* No camera system. */ }
+                try {
+                    var roots = children(a.root), n = 0;
+                    for (var j = 0; j < roots.length; j++) n += countActive(roots[j]);
+                    s.active = n;
+                } catch (e) { /* Engine not ready. */ }
+                var prev = a.counters && a.counters.previous;
+                if (prev && typeof prev.drawCalls === 'number') s.draws = prev.drawCalls;
+                return s;
+            }
+            function differs(x, y) {
+                if (!x || !y) return null;
+                var why = [];
+                if (x.cam && y.cam) {
+                    var d = Math.sqrt(Math.pow(x.cam[0] - y.cam[0], 2) + Math.pow(x.cam[1] - y.cam[1], 2) + Math.pow(x.cam[2] - y.cam[2], 2));
+                    if (d > 0.02) why.push('camera moved ' + r3(d) + ' apart');
+                }
+                if (typeof x.active === 'number' && typeof y.active === 'number' && x.active !== y.active) why.push('active objects ' + x.active + ' → ' + y.active);
+                return why.length ? why.join(', ') : null;
+            }
+
+            // Checks: { object: name } or { path } with active, or + script / field / equals for a MonoBehaviour field.
+            function findByName(name) {
+                var found = null;
+                walk(function (e) { if (e.name === name) { found = e; return false; } });
+                return found;
+            }
+            function evalCheck(c) {
+                var out = { check: c };
+                try {
+                    var e = c.path ? entityAt(c.path) : c.object ? findByName(c.object) : null;
+                    if (!e) { out.actual = { found: false }; return out; }
+                    out.actual = { found: true, active: !!e.enabled };
+                    if (c.field) out.actual.value = summarize(own(scriptOn(e, c.script).code, c.field), 1);
+                } catch (err) { out.actual = { error: String(err && err.message || err) }; }
+                return out;
+            }
+            function judge(c, actual) {
+                if (!actual || actual.error) return false;
+                if (c.field) return actual.found && JSON.stringify(actual.value) === JSON.stringify(c.equals);
+                if (typeof c.active === 'boolean') return !!actual.found && actual.active === c.active;
+                return !!actual.found;
+            }
+
+            // ---------- Recording ----------
+            function recNote(ev) {
+                var last = rec.events[rec.events.length - 1];
+                if (ev[1] === 'm' && last && last[1] === 'm' && last[0] === ev[0]) rec.events[rec.events.length - 1] = ev;    // One move per tick.
+                else rec.events.push(ev);
+            }
+            function recPointer(kind, phase, x, y) {
+                if (!rec || !rec.running) return;
+                if (!rec.kind) rec.kind = kind;
+                if (phase === 'd') rec.down = true;
+                else if (!rec.down) return;                  // Moves count only while pressed.
+                if (phase === 'u') rec.down = false;
+                recNote([rec.dt.length, phase, x, y]);      // Full precision: the replay lands on the same pixel.
+            }
+            function relative(clientX, clientY) {
+                var c = canvasOf(currentApp());
+                if (!c) return null;
+                var r = c.getBoundingClientRect();
+                return r.width && r.height ? { x: (clientX - r.left) / r.width, y: (clientY - r.top) / r.height } : null;
+            }
+            function onRecordEvent(e) {
+                if (!rec || !rec.running || !e.isTrusted || isPanel(e)) return;
+                var t = e.type;
+                if (t === 'keydown' || t === 'keyup') {
+                    if (e.key === '`' || e.repeat) return;   // The panel's hotkey; auto-repeat follows from the held key.
+                    recNote([rec.dt.length, t === 'keydown' ? 'kd' : 'ku', e.key, e.code, e.keyCode || 0]);
+                    return;
+                }
+                if (t.indexOf('touch') === 0) {
+                    var touch = e.changedTouches && e.changedTouches[0];
+                    if (!touch) return;
+                    if (t === 'touchstart') { if (rec.touchId !== null) return; rec.touchId = touch.identifier; }
+                    else if (touch.identifier !== rec.touchId) return;
+                    var tp = relative(touch.clientX, touch.clientY);
+                    if (!tp) return;
+                    if (t === 'touchend' || t === 'touchcancel') rec.touchId = null;
+                    recPointer('touch', t === 'touchstart' ? 'd' : t === 'touchmove' ? 'm' : 'u', tp.x, tp.y);
+                    return;
+                }
+                if (e.button !== 0 && t !== 'mousemove') return;
+                if (t === 'mousedown' && e.target !== canvasOf(currentApp())) return;
+                var mp = relative(e.clientX, e.clientY);
+                if (mp) recPointer('mouse', t === 'mousedown' ? 'd' : t === 'mousemove' ? 'm' : 'u', mp.x, mp.y);
+            }
+            // Runs one engine tick at the frozen clock and notes its raw delta (ms), time scale / pause changes and samples.
+            // simDtMs: luna_simulate's fixed delta (the tick then starts that long after the previous one).
+            function recTick(a, run, simDtMs) {
+                if (!rec.started) {
+                    rec.started = true;
+                    rec.startFrame = a.frame;
+                    clockStart(a, RealDate.now() - (realPerfNow() + clock.offset - a._time));
+                    try { rec.overrides = JSON.parse(JSON.stringify(win.playgroundOverrides || {})); } catch (e) { rec.overrides = {}; }
+                    rec.viewport = viewport();
+                }
+                var k = rec.dt.length;
+                if (a.timeScale !== rec.scale || !!a.paused !== rec.paused) {
+                    rec.scale = a.timeScale;
+                    rec.paused = !!a.paused;
+                    rec.events.push([k, 's', rec.scale, rec.paused]);
+                }
+                var at = q(realPerfNow() + clock.offset);
+                if (simDtMs !== undefined) a._time = at - q(simDtMs);
+                clock.frozen = Math.max(at, a._time);
+                var before = a._time;
+                run();
+                rec.dt.push(a._time - before);
+                rec.ms += Math.min(100, Math.max(0, a._time - before));
+                if ((k + 1) % SAMPLE_EVERY === 0) rec.samples.push(sample(a, k));
+            }
+            function recordingObject(opts) {
+                var a = currentApp() || getApp(), checks = (opts.checks || []).slice();
+                if (opts.expectObject) checks.unshift({ object: opts.expectObject });
+                // A check without an expected value takes the state at the stop.
+                checks = checks.map(function (c) {
+                    var r = evalCheck(c), done = {};
+                    for (var key in c) done[key] = c[key];
+                    if (r.actual && r.actual.found && !c.field && typeof c.active !== 'boolean') done.active = r.actual.active;
+                    if (r.actual && r.actual.found && c.field && !('equals' in c)) done.equals = r.actual.value;
+                    return done;
+                });
+                return {
+                    format: 'luna-devtools-recording', version: 1,
+                    name: rec.name, outcome: opts.outcome || '', createdAt: new Date().toISOString(),
+                    page: { path: win.location.pathname, title: win.document.title },
+                    input: rec.kind || 'mouse', viewport: rec.viewport || viewport(), seed: rec.seed,
+                    config: { playgroundOverrides: rec.overrides || {} }, clock: { date0: clock.date0, quantum: 1 / 1024 },
+                    ticks: rec.dt.length, seconds: r3(rec.ms / 1000), startFrame: rec.startFrame,
+                    sampleEvery: SAMPLE_EVERY,
+                    dt: rec.dt, events: rec.events, samples: rec.samples,
+                    final: a ? sample(a, rec.dt.length - 1) : null,
+                    checks: checks
+                };
+            }
+
+            // ---------- Replay ----------
+            var channelPort = null, queued = null;
+            function soon(fn) {        // A macrotask that hidden tabs do not throttle (timers drop to 1/s there).
+                if (!channelPort) {
+                    var mc = new win.MessageChannel();
+                    mc.port1.onmessage = function () { var f = queued; queued = null; if (f) f(); };
+                    channelPort = mc.port2;
+                }
+                queued = fn;
+                channelPort.postMessage(0);
+            }
+            function fireEvent(a, ev) {
+                var c = canvasOf(a);
+                if (ev[1] === 'kd' || ev[1] === 'ku') {
+                    var ke = new win.KeyboardEvent(ev[1] === 'kd' ? 'keydown' : 'keyup', { key: ev[2], code: ev[3], bubbles: true, cancelable: true });
+                    try {
+                        Object.defineProperty(ke, 'keyCode', { get: function () { return ev[4]; } });
+                        Object.defineProperty(ke, 'which', { get: function () { return ev[4]; } });
+                    } catch (e) { /* Read-only in this browser. */ }
+                    // The engine's keyboard listens on the body (bubbles on to document / window listeners).
+                    (a.keyboard && a.keyboard._element && a.keyboard._element.dispatchEvent ? a.keyboard._element : win.document.body || win.document).dispatchEvent(ke);
+                    return;
+                }
+                if (ev[1] === 's') {
+                    a.timeScale = ev[2];
+                    a.paused = ev[3];
+                    return;
+                }
+                if (!c) return;
+                var r = c.getBoundingClientRect(), cx = r.left + ev[2] * r.width, cy = r.top + ev[3] * r.height;
+                var useTouch = rp.kind === 'touch' && !!a.touch && typeof win.Touch === 'function';
+                if (useTouch) {
+                    var type = ev[1] === 'd' ? 'touchstart' : ev[1] === 'm' ? 'touchmove' : 'touchend';
+                    var t = new win.Touch({ identifier: 1, target: c, clientX: cx, clientY: cy, pageX: cx, pageY: cy });
+                    var live = type === 'touchend' ? [] : [t];
+                    c.dispatchEvent(new win.TouchEvent(type, { bubbles: true, cancelable: true, touches: live, targetTouches: live, changedTouches: [t] }));
+                } else {
+                    var mtype = ev[1] === 'd' ? 'mousedown' : ev[1] === 'm' ? 'mousemove' : 'mouseup';
+                    c.dispatchEvent(new win.MouseEvent(mtype, { bubbles: true, cancelable: true, view: win, button: 0,
+                        buttons: mtype === 'mouseup' ? 0 : 1, clientX: cx, clientY: cy }));
+                }
+                rp.pressed = ev[1] === 'u' ? null : ev;
+            }
+            function blockRealInput(e) {
+                if (rp && rp.running && e.isTrusted && !isPanel(e) && !(e.type === 'keydown' && e.key === '`')) {
+                    e.stopImmediatePropagation();
+                    if (e.cancelable && e.type.indexOf('touch') !== 0) e.preventDefault();
+                }
+            }
+            function startReplay(a) {
+                if (rp.started) return;
+                rp.started = true;
+                rp.app = a;
+                rp.t0 = realNow();
+                rp.v = a._time;                     // Tick 0's time (Application.start): replay times count from it.
+                clockStart(a, (rp.rec.clock || {}).date0);
+                rp.viewportNow = viewport();
+                if (!rp.applyConfig) {
+                    try { rp.pageOverrides = JSON.parse(JSON.stringify(win.playgroundOverrides || {})); } catch (e) { rp.pageOverrides = {}; }
+                }
+                soon(step);
+            }
+            function step() {
+                var a = rp.app, rec0 = rp.rec, budget = realNow() + (win.document.hidden ? 250 : 12);
+                try {
+                    while (rp.k < rp.end) {
+                        if (rp.speed > 0 && realNow() < rp.t0 + rp.ms / rp.speed) break;    // Paced: wait for the wall clock.
+                        var k = rp.k;
+                        while (rp.ev < rec0.events.length && rec0.events[rp.ev][0] <= k) fireEvent(a, rec0.events[rp.ev++]);
+                        var next = rp.v + rec0.dt[k];        // Exact: multiples of 1/1024 ms.
+                        clock.frozen = next;
+                        a._time = rp.v;
+                        a.tick(next);
+                        rp.v = next;
+                        rp.ms += Math.min(100, Math.max(0, rec0.dt[k]));
+                        rp.k++;
+                        if ((k + 1) % SAMPLE_EVERY === 0) {
+                            var s = sample(a, k), want = rp.samplesByTick[k];
+                            if (want && !rp.divergence) {
+                                var why = differs(want, s);
+                                if (why) rp.divergence = { tick: k, seconds: r3(rp.ms / 1000), why: why, recorded: want, replayed: s };
+                            }
+                        }
+                        while (rp.shots.length && rp.shots[0].tick <= k) {
+                            var shot = rp.shots.shift();
+                            try {
+                                var g = grab(rp.maxWidth, false);
+                                rp.images.push({ seconds: shot.seconds, tick: k, width: g.width, height: g.height, base64: g.base64, mimeType: g.mimeType });
+                            } catch (e) { /* No canvas. */ }
+                        }
+                        if (realNow() > budget) break;
+                    }
+                } catch (e) {
+                    rp.failure = String(e && e.message || e);
+                    rp.end = rp.k;
+                }
+                if (rp.k >= rp.end) finish();
+                else if (rp.speed > 0) setTimeout(function () { soon(step); }, 4);
+                else soon(step);
+            }
+            function finish() {
+                var a = rp.app, rec0 = rp.rec;
+                rp.running = false;
+                while (rp.shots.length) {          // Asked past the end: the last state.
+                    var shot = rp.shots.shift();
+                    try { var g = grab(rp.maxWidth, true); rp.images.push({ seconds: shot.seconds, tick: rp.k - 1, width: g.width, height: g.height, base64: g.base64, mimeType: g.mimeType }); } catch (e) { /* No canvas. */ }
+                }
+                var final = sample(a, rp.k - 1), complete = rp.k >= rec0.dt.length;
+                var checks = complete ? (rec0.checks || []).map(function (c) {
+                    var r = evalCheck(c);
+                    return { check: c, actual: r.actual, pass: judge(c, r.actual) };
+                }) : [];
+                var errors = agent.console.list().slice().sort(function (x, y) { return (x.level === y.level ? 0 : x.level === 'error' ? -1 : 1) || y.count - x.count; });
+                lastResult = {
+                    name: rec0.name, outcome: rec0.outcome || '', completed: complete && !rp.failure,
+                    ticks: rp.k, of: rec0.dt.length, seconds: r3(rp.ms / 1000), realMs: Math.round(realNow() - rp.t0),
+                    speed: rp.speed || 'fast',
+                    passed: complete && !rp.failure && checks.every(function (c) { return c.pass; }),
+                    checks: checks,
+                    divergence: rp.divergence || null,
+                    final: complete ? { recorded: rec0.final || null, replayed: final, differs: differs(rec0.final, final),
+                        identical: !!rec0.final && JSON.stringify(rec0.final) === JSON.stringify(final) } : null,
+                    config: rp.applyConfig ? { applied: true, pageHadOverrides: rp.shellOverrides !== undefined }
+                        : { applied: false, sameAsRecording: JSON.stringify(rp.pageOverrides || {}) === JSON.stringify((rec0.config || {}).playgroundOverrides || {}) },
+                    viewport: { recorded: rec0.viewport || null, replay: rp.viewportNow,
+                        matches: !!rec0.viewport && rec0.viewport.width === rp.viewportNow.width && rec0.viewport.height === rp.viewportNow.height },
+                    errors: { errors: agent.console.errorCount(), messages: agent.console.total(),
+                        top: errors.slice(0, 8).map(function (e) { return { level: e.level, count: e.count, message: e.message.slice(0, 300), firstFrame: e.firstFrame }; }) },
+                    screenshots: rp.images
+                };
+                if (rp.failure) lastResult.failure = rp.failure;
+                if (rp.stopAt && rp.k < rec0.dt.length) lastResult.note = 'Stopped at ' + lastResult.seconds + ' s as asked (stopAtSeconds): checks run only at the end.';
+                if (rp.pressed && complete) lastResult.note = (lastResult.note ? lastResult.note + ' ' : '') + 'The recording ends with the pointer still down.';
+                if (!rec0.clock) lastResult.note = (lastResult.note ? lastResult.note + ' ' : '') +
+                    'Recorded before the virtual clock: record it again for an exact replay.';
+                unfreeze();                          // The clock runs on from the replay's last tick.
+                engineRaf.call(win, a.tick);        // Back to the browser's own frames.
+                var list = waiters;
+                waiters = [];
+                list.forEach(function (w) { w(lastResult); });
+            }
+
+            if (mode) {
+                // Before Luna runs: the clock, the engine loop, Math.random and (replay) the Playground overrides.
+                installClock();
+                win.requestAnimationFrame = function (cb) {
+                    var a = cb ? currentApp() : null;
+                    if (a && cb === a.tick) {
+                        if (rp && rp.running) { startReplay(a); return 0; }
+                        if (rec && rec.running) return engineRaf.call(win, function (ts) { recTick(a, function () { cb(ts); }); });
+                    }
+                    return engineRaf.apply(win, arguments);
+                };
+                ['mousedown', 'mousemove', 'mouseup', 'touchstart', 'touchmove', 'touchend', 'touchcancel', 'keydown', 'keyup'].forEach(function (t) {
+                    win.addEventListener(t, mode === 'record' ? onRecordEvent : blockRealInput, true);
+                });
+            }
+            if (mode === 'record') {
+                rec = { running: true, name: arm.name || 'recording', seed: (arm.seed >>> 0) || ((nativeRandom() * 4294967296) >>> 0),
+                    dt: [], events: [], samples: [], kind: null, down: false, touchId: null, scale: 1, paused: false, ms: 0, started: false };
+                seedRandom(rec.seed);
+            } else if (mode === 'replay') {
+                var r0 = arm.recording || {}, o = arm.options || {};
+                var stopAt = +o.stopAtSeconds > 0 ? +o.stopAtSeconds : 0, end = (r0.dt || []).length;
+                if (stopAt) { var acc = 0; for (var i = 0; i < end; i++) { acc += Math.min(100, r0.dt[i]); if (acc >= stopAt * 1000) { end = i + 1; break; } } }
+                var shots = [], cum = 0, secs = (o.screenshots || []).map(Number).filter(function (x) { return x >= 0; }).sort(function (x, y) { return x - y; });
+                for (var t = 0, si = 0; t < (r0.dt || []).length && si < secs.length; t++) {
+                    cum += Math.min(100, Math.max(0, r0.dt[t]));
+                    while (si < secs.length && cum >= secs[si] * 1000) shots.push({ seconds: secs[si++], tick: t });
+                }
+                while (si < secs.length) shots.push({ seconds: secs[si++], tick: Infinity });
+                var byTick = {};
+                (r0.samples || []).forEach(function (s) { byTick[s.k] = s; });
+                rp = { running: true, started: false, rec: r0, k: 0, ev: 0, end: end, ms: 0, speed: Math.max(0, +o.speed || 0),
+                    applyConfig: o.applyConfig !== false, maxWidth: o.maxWidth || 360, stopAt: stopAt, shots: shots, images: [],
+                    samplesByTick: byTick, divergence: null, kind: r0.input || 'mouse', pressed: null };
+                seedRandom(r0.seed >>> 0);
+                if (rp.applyConfig && r0.config && r0.config.playgroundOverrides) {
+                    var forced = r0.config.playgroundOverrides;
+                    try {
+                        Object.defineProperty(win, 'playgroundOverrides', {
+                            configurable: true,
+                            get: function () { return forced; },
+                            set: function (v) { rp.shellOverrides = v; }       // The Dev Environment's own values: kept aside.
+                        });
+                    } catch (e) { fail('replay overrides', e); }
+                }
+            }
+
+            function post(body) {
+                return win.fetch(RECORDINGS_ROUTE, { method: 'POST', cache: 'no-store', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+                    .then(function (r) { return r.json(); }).then(function (j) { if (j.error) throw new Error(j.error); return j; });
+            }
+
+            function armAndReload(value) {
+                win.sessionStorage.setItem(INPUT_ARM, JSON.stringify(value));
+                setTimeout(function () { win.location.reload(); }, 150);
+            }
+
+            return {
+                state: function () {
+                    if (rec) return { mode: 'record', running: rec.running, name: rec.name, ticks: rec.dt.length, seconds: r3(rec.ms / 1000),
+                        events: rec.events.length, input: rec.kind };
+                    if (rp) return { mode: 'replay', running: rp.running, name: rp.rec.name, ticks: rp.k, of: rp.rec.dt.length,
+                        seconds: r3(rp.ms / 1000), speed: rp.speed || 'fast', result: lastResult ? summaryOf(lastResult) : null };
+                    return { mode: null };
+                },
+                record: function (name, opts) {
+                    if (!name || !String(name).trim()) throw new Error('A recording needs a name.');
+                    opts = opts || {};
+                    armAndReload({ mode: 'record', name: String(name).trim(), seed: opts.seed });
+                    return { reloading: true, session: channel.id, previousLoadId: channel.loadId };
+                },
+                stop: function (opts) {
+                    if (!rec || !rec.running) return Promise.reject(new Error('Not recording (start one with luna_record action=start, or Record in the Dev Tools).'));
+                    if (!rec.started) return Promise.reject(new Error('The engine has not run a frame yet.'));
+                    rec.running = false;
+                    unfreeze();
+                    var recording = recordingObject(opts || {});
+                    if (opts && opts.save === false) return Promise.resolve({ recording: recording });
+                    return post({ action: 'save', recording: recording }).then(function (j) {
+                        return { saved: j.file, name: recording.name, ticks: recording.ticks, seconds: recording.seconds, events: recording.events.length,
+                            input: recording.input, checks: recording.checks, outcome: recording.outcome, viewport: recording.viewport };
+                    });
+                },
+                cancel: function () { if (rec) { rec.running = false; unfreeze(); } },
+                replay: function (nameOrRecording, opts) {
+                    var go = function (recording) {
+                        if (!recording || !Array.isArray(recording.dt)) throw new Error('Not a recording (no dt list).');
+                        opts = opts || {};
+                        var v = recording.viewport, frame = null;
+                        try { frame = win.frameElement; } catch (e) { frame = null; }
+                        var resized = false;
+                        if (opts.matchViewport !== false && v && frame && (win.innerWidth !== v.width || win.innerHeight !== v.height)) {
+                            frame.style.width = v.width + 'px';
+                            frame.style.height = v.height + 'px';
+                            resized = true;
+                        }
+                        armAndReload({ mode: 'replay', recording: recording, options: opts });
+                        return { reloading: true, session: channel.id, previousLoadId: channel.loadId, name: recording.name,
+                            ticks: recording.ticks, seconds: recording.seconds, viewportSet: resized };
+                    };
+                    if (typeof nameOrRecording === 'object') return Promise.resolve(go(nameOrRecording));
+                    return win.fetch(RECORDINGS_ROUTE + '?name=' + encodeURIComponent(nameOrRecording), { cache: 'no-store' })
+                        .then(function (r) { if (!r.ok) throw new Error('No recording "' + nameOrRecording + '".'); return r.json(); })
+                        .then(go);
+                },
+                result: function (timeoutMs) {
+                    if (!rp) return Promise.reject(new Error('No replay in this page load (luna_replay arms it and reloads).'));
+                    if (lastResult) return Promise.resolve(lastResult);
+                    return new Promise(function (resolve, reject) {
+                        waiters.push(resolve);
+                        setTimeout(function () { reject(new Error('The replay is still running after ' + Math.round(timeoutMs / 1000) + ' s (at tick ' + rp.k + ' of ' + rp.end + ').')); }, timeoutMs);
+                    });
+                },
+                last: function () { return lastResult; },
+                list: function () {
+                    return win.fetch(RECORDINGS_ROUTE, { cache: 'no-store' }).then(function (r) { return r.json(); });
+                },
+                remove: function (name) { return post({ action: 'delete', name: name }); },
+                replaying: function () { return !!(rp && rp.running); },
+                // luna_simulate's input and ticks while recording.
+                simEvent: function (kind, phase, x, y) { recPointer(kind, phase, x, y); },
+                // One luna_simulate tick of dtMs: recorded when a recording runs, on the page's clock (virtual or real).
+                simTick: function (a, dtMs) {
+                    if (rec && rec.running) { recTick(a, function () { a.tick(); }, dtMs); return; }
+                    var now = clock.installed ? vNow() : realNow();
+                    a._time = now - dtMs;            // The engine's delta is now - _time: exactly dt.
+                    a.tick(now);
+                }
+            };
+
+            function summaryOf(r) {
+                return { completed: r.completed, passed: r.passed, seconds: r.seconds, realMs: r.realMs,
+                    divergence: r.divergence ? r.divergence.seconds + ' s: ' + r.divergence.why : null,
+                    checks: r.checks.map(function (c) { return { check: c.check, pass: c.pass, actual: c.actual }; }),
+                    errors: r.errors.errors, failure: r.failure || null };
+            }
+        })();
+        agent.inputs = inputs;
+
         function waitForMaps(ms) {
             return new Promise(function (resolve) {
                 var until = realNow() + ms;
@@ -1390,18 +1928,7 @@
                 return { paused: c.paused(), timeScale: c.scale(), frame: a ? a.frame : 0 };
             },
 
-            screenshot: function (p) {
-                var canvas = agent.gl.canvas();
-                if (!canvas) throw new Error('No WebGL canvas yet.');
-                redraw();                          // The drawing buffer is valid for the rest of this task.
-                var w = Math.max(16, Math.min(p.maxWidth || 540, canvas.width)), h = Math.round(canvas.height * w / canvas.width);
-                var copy = win.document.createElement('canvas');
-                copy.width = w;
-                copy.height = h;
-                copy.getContext('2d').drawImage(canvas, 0, 0, w, h);
-                var url = copy.toDataURL('image/jpeg', 0.85), a = getApp();
-                return { base64: url.slice(url.indexOf(',') + 1), mimeType: 'image/jpeg', width: w, height: h, frame: a ? a.frame : 0 };
-            },
+            screenshot: function (p) { return grab(p.maxWidth || 540, true); },
 
             watch: function (p) {
                 if (!p.field) throw new Error('field is required');
@@ -1464,6 +1991,18 @@
 
             simulate: function (p) { return simulate(p); },
 
+            inputState: function () { return inputs.state(); },
+            recordStart: function (p) { return inputs.record(p.name, { seed: p.seed }); },
+            recordStop: function (p) {
+                if (p.cancel) { inputs.cancel(); return { cancelled: true }; }
+                return inputs.stop({ outcome: p.outcome, expectObject: p.expectObject, checks: p.checks });
+            },
+            replayStart: function (p) {
+                return inputs.replay(p.name, { speed: p.speed, applyConfig: p.applyConfig, matchViewport: p.matchViewport,
+                    screenshots: p.screenshotsAt, maxWidth: p.maxWidth, stopAtSeconds: p.stopAtSeconds });
+            },
+            replayResult: function (p) { return inputs.result(Math.max(1000, +p.timeoutMs || 120000)); },
+
             reload: function () {
                 setTimeout(function () { win.location.reload(); }, 150);
                 return { reloading: true, session: channel.id, previousLoadId: channel.loadId };
@@ -1478,6 +2017,7 @@
         function simulate(p) {
             var a = getApp();
             if (!a) throw new Error('The Luna engine has not started yet.');
+            if (inputs.replaying()) throw new Error('A replay is running in this page: wait for luna_replay to finish.');
             var steps = p.steps;
             if (!Array.isArray(steps) || !steps.length) throw new Error('steps is required: [{ x, y, frames }, { frames }, ...]');
             var canvas = (a.graphicsDevice && a.graphicsDevice.canvas) || agent.gl.canvas();
@@ -1490,6 +2030,7 @@
             var pointer = null, ran = 0, errorsBefore = agent.console.errorCount(), totalBefore = agent.console.total(), t0 = realNow();
 
             function fire(type, x, y) {
+                inputs.simEvent(useTouch ? 'touch' : 'mouse', /start|down/.test(type) ? 'd' : /move/.test(type) ? 'm' : 'u', x, y);
                 var cx = rect.left + x * rect.width, cy = rect.top + y * rect.height;
                 if (useTouch) {
                     var t = new win.Touch({ identifier: 1, target: canvas, clientX: cx, clientY: cy, pageX: cx, pageY: cy });
@@ -1504,9 +2045,7 @@
             function move(x, y) { fire(useTouch ? 'touchmove' : 'mousemove', x, y); }
             function release(x, y) { fire(useTouch ? 'touchend' : 'mouseup', x, y); }
             function tick() {
-                var now = realNow();
-                a._time = now - dt * 1000;      // The engine's delta is now - _time: exactly dt.
-                a.tick(now);
+                inputs.simTick(a, dt * 1000);    // Noted when a recording runs.
                 ran++;
             }
 
@@ -1677,7 +2216,8 @@
             '<div class="panel" style="display:none">' +
             '<div class="head"><span class="title">Luna Dev Tools</span><span class="x" title="Hide (` key)">✕</span></div>' +
             '<div class="tabs"><div class="tab" data-tab="stats">Stats</div><div class="tab" data-tab="frame">Frame</div>' +
-            '<div class="tab" data-tab="hot">Hot paths</div><div class="tab" data-tab="errors">Errors</div><div class="tab" data-tab="controls">Controls</div></div>' +
+            '<div class="tab" data-tab="hot">Hot paths</div><div class="tab" data-tab="errors">Errors</div><div class="tab" data-tab="controls">Controls</div>' +
+            '<div class="tab" data-tab="replay">Replay</div></div>' +
             '<div class="body"></div></div>';
         (doc.body || doc.documentElement).appendChild(host);
 
@@ -1966,6 +2506,76 @@
             return html;
         }
 
+        // ---------- Replay: record a play from the start, replay it later (also luna_record / luna_replay) ----------
+        var recName = '', recOutcome = '', recExpect = load('recExpect', endCardName), replaySpeed = load('replaySpeed', 1),
+            replayApply = load('replayApply', true), recordings = null, recordingsError = '';
+
+        function refreshRecordings(a) {
+            recordingsError = '';
+            a.inputs.list().then(function (j) { recordings = j.recordings || []; render(true); },
+                function (e) { recordings = []; recordingsError = 'Could not list recordings: ' + (e && e.message || e); render(true); });
+        }
+
+        function secs(v) { return (Math.round(v * 10) / 10).toFixed(1) + ' s'; }
+
+        function resultHtml(r) {
+            if (!r) return '';
+            var html = '<div class="row"><b class="' + (r.passed ? 'good' : 'bad') + '">' + (r.passed ? 'PASS' : r.completed ? 'FAIL' : 'NOT FINISHED') + '</b>' +
+                '<span class="note">' + secs(r.seconds) + ' in ' + n(r.realMs) + ' ms' + (r.outcome ? ' · expected: ' + esc(r.outcome) : '') + '</span></div>';
+            (r.checks || []).forEach(function (c) {
+                var what = c.check.object || c.check.path || '';
+                var want = c.check.field ? c.check.field + ' = ' + JSON.stringify(c.check.equals) : typeof c.check.active === 'boolean' ? (c.check.active ? 'active' : 'inactive') : 'exists';
+                html += '<div class="note ' + (c.pass ? 'good' : 'bad') + '">' + (c.pass ? '✓ ' : '✗ ') + esc(what) + ' ' + esc(want) +
+                    (c.pass ? '' : ' (got ' + esc(JSON.stringify(c.actual)) + ')') + '</div>';
+            });
+            if (r.divergence) html += '<div class="note warn">Differs from the recording from ' + r.divergence + '</div>';
+            if (r.errors) html += '<div class="note ' + (r.errors ? 'bad' : '') + '">' + r.errors + ' error(s) logged: see the Errors tab.</div>';
+            if (r.failure) html += '<div class="note bad">' + esc(r.failure) + '</div>';
+            return html;
+        }
+
+        function replayTab(a) {
+            var st = a.inputs.state(), html = '';
+            if (recordings === null) refreshRecordings(a);
+            if (st.mode === 'record' && st.running) {
+                html += '<div class="sec"><span class="bad">●</span> Recording "' + esc(st.name) + '"</div>' +
+                    '<div class="note">' + secs(st.seconds) + ' · ' + n(st.ticks) + ' ticks · ' + n(st.events) + ' input events' + (st.input ? ' (' + st.input + ')' : '') + '</div>' +
+                    '<div class="row"><input type="text" data-in="recoutcome" value="' + esc(recOutcome) + '" placeholder="Expected result, e.g. win / lose"></div>' +
+                    '<div class="row"><input type="text" data-in="recexpect" value="' + esc(recExpect) + '" placeholder="Object to check at the end (e.g. EndCard)"></div>' +
+                    '<div class="row"><button data-act="recstop" class="on">■ Stop &amp; save</button><button data-act="reccancel">Cancel</button></div>' +
+                    '<div class="note">Play normally. Stop saves to LunaRecordings/ in the project, with the named object\'s state at the stop as the expected end.</div>';
+            } else {
+                html += '<div class="sec">Record</div><div class="row"><input type="text" data-in="recname" value="' + esc(recName) + '" placeholder="Name, e.g. full flow - win">' +
+                    '<button data-act="recstart"' + (recName.trim() ? '' : ' disabled') + '>● Record</button></div>' +
+                    '<div class="note">Reloads the playable and records every tick and input (mouse, touch, keys) from its first frame.</div>';
+            }
+            if (st.mode === 'replay') {
+                html += '<div class="sec">Replay "' + esc(st.name) + '"</div>';
+                if (st.running) html += '<div class="note">' + Math.round(100 * st.ticks / Math.max(1, st.of)) + '% · ' + secs(st.seconds) + '</div>';
+                else html += resultHtml(st.result);
+            }
+            html += '<div class="sec">Recordings <button data-act="reclist">↻</button></div>';
+            if (recordingsError) html += '<div class="note bad">' + esc(recordingsError) + '</div>';
+            if (recordings && recordings.length) {
+                html += '<div class="scroll"><table><tr><th>Name</th><th>Length</th><th>Expect</th><th></th></tr>';
+                recordings.forEach(function (r) {
+                    html += '<tr title="' + esc(r.file + (r.createdAt ? '\n' + r.createdAt : '')) + '"><td>' + esc(r.name) + '</td><td>' + secs(r.seconds || 0) + '</td><td>' + esc(r.outcome || '') +
+                        '</td><td><button data-play="' + esc(r.name) + '">▶</button> <button data-del="' + esc(r.name) + '">✕</button></td></tr>';
+                });
+                html += '</table></div>';
+            } else if (recordings) {
+                html += '<div class="note">No recording yet.</div>';
+            }
+            html += '<div class="row">Speed ' + [0, 1, 2, 4].map(function (x) {
+                return '<button data-speed="' + x + '" class="' + (x === replaySpeed ? 'on' : '') + '">' + (x ? '×' + x : 'Fast') + '</button>';
+            }).join('') + '</div>' +
+                '<div class="row"><button data-act="replayapply" class="' + (replayApply ? 'on' : '') + '">Use recorded Playground values</button></div>' +
+                '<div class="note">▶ reloads the playable and replays it tick by tick (Math.random seeded, viewport set as recorded). ' +
+                'Your own input is ignored until it ends. Agents: luna_recordings, luna_replay, luna_record.</div>';
+            if (actionMessage) html += '<div class="note">' + esc(actionMessage) + '</div>';
+            return html;
+        }
+
         var lastRender = 0, renderedTab = null, sliding = false;
 
         // Updates `from` in place to match `to`: elements under the pointer, focus, scroll positions,
@@ -2027,7 +2637,7 @@
             errorTab.classList.toggle('bad', errorCount > 0);
 
             show(tab === 'frame' ? frameTab(a, s) : tab === 'hot' ? hotTab(a, s) : tab === 'errors' ? errorsTab(a) :
-                tab === 'controls' ? controlsTab(a) : statsTab(a, s));
+                tab === 'controls' ? controlsTab(a) : tab === 'replay' ? replayTab(a) : statsTab(a, s));
 
             var fg = body.querySelector('canvas[data-g=frame]');
             if (fg) graph(fg, s.frameHistory, 34, [16.7, 33.3], '#4f8ff7');
@@ -2070,6 +2680,34 @@
             });
             var input = body.querySelector('[data-in=endcard]');
             if (input) input.oninput = function () { endCardName = input.value; save('endCard', endCardName); };
+            var nameIn = body.querySelector('[data-in=recname]');
+            if (nameIn) nameIn.oninput = function () {
+                recName = nameIn.value;
+                var go = body.querySelector('[data-act=recstart]');
+                if (go) go.disabled = !recName.trim();
+            };
+            var outIn = body.querySelector('[data-in=recoutcome]');
+            if (outIn) outIn.oninput = function () { recOutcome = outIn.value; };
+            var expIn = body.querySelector('[data-in=recexpect]');
+            if (expIn) expIn.oninput = function () { recExpect = expIn.value; save('recExpect', recExpect); };
+            body.querySelectorAll('[data-speed]').forEach(function (el) {
+                el.onclick = function () { replaySpeed = parseFloat(el.getAttribute('data-speed')); save('replaySpeed', replaySpeed); render(true); };
+            });
+            body.querySelectorAll('[data-play]').forEach(function (el) {
+                el.onclick = function () {
+                    actionMessage = 'Starting the replay…';
+                    a.inputs.replay(el.getAttribute('data-play'), { speed: replaySpeed, applyConfig: replayApply })
+                        .then(function () { actionMessage = ''; }, function (e) { actionMessage = 'Replay failed: ' + (e && e.message || e); render(true); });
+                    render(true);
+                };
+            });
+            body.querySelectorAll('[data-del]').forEach(function (el) {
+                el.onclick = function () {
+                    var name = el.getAttribute('data-del');
+                    if (!hostWin.confirm('Delete the recording "' + name + '"?')) return;
+                    a.inputs.remove(name).then(function () { refreshRecordings(a); }, function (e) { actionMessage = 'Delete failed: ' + (e && e.message || e); render(true); });
+                };
+            });
         }
 
         function action(a, act) {
@@ -2093,6 +2731,19 @@
             else if (act === 'copylogs') copyText(a.console.report());
             else if (act === 'activate') actionMessage = a.controls.activate(endCardName.trim());
             else if (act === 'spector') loadSpector(a);
+            else if (act === 'recstart') {
+                try { a.inputs.record(recName); recOutcome = ''; } catch (e) { actionMessage = String(e && e.message || e); }
+            }
+            else if (act === 'recstop') {
+                actionMessage = 'Saving…';
+                a.inputs.stop({ outcome: recOutcome.trim(), expectObject: recExpect.trim() || undefined }).then(function (r) {
+                    actionMessage = 'Saved ' + r.saved + ' (' + secs(r.seconds) + ', ' + r.events + ' input events).';
+                    refreshRecordings(a);
+                }, function (e) { actionMessage = 'Save failed: ' + (e && e.message || e); render(true); });
+            }
+            else if (act === 'reccancel') { a.inputs.cancel(); actionMessage = 'Recording cancelled.'; }
+            else if (act === 'reclist') refreshRecordings(a);
+            else if (act === 'replayapply') { replayApply = !replayApply; save('replayApply', replayApply); }
             render(true);
         }
 
