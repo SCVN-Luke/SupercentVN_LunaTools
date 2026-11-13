@@ -205,6 +205,25 @@ Static initializers are wrapped to report their exceptions (called through uncha
 The protocol, channel and JSON code (`Mcp/`, `DevToolsProxy`, `LunaMachine`) use no Unity API and are
 tested outside the Editor.
 
+## Runtime fixes for Luna bugs
+
+`Runtime/` is compiled into the game (Assembly-CSharp, no asmdef) and only acts in Luna builds
+(`#if UNITY_LUNA`, JavaScript through `Bridge.Script.Write`); in the Editor it does nothing.
+
+- `LunaDynamicBatchingFix`: with dynamic batching on (`luna.json` `unity.enableDynamicBatching`), Luna
+  7.2 can draw batched meshes as huge stretched shapes or drop them; planar shadows are hit first.
+  A batch group appends a per-vertex matrix index (`ATTR0`) after its vertex data, but
+  `DynamicBatchGroup.addMatrixIndexAttribute` hands every group with the same vertex layout one pooled
+  format object and overwrites its `ATTR0` offset; attributes are re-applied from it on each draw, so a
+  group that did not rebuild reads its matrix indices at another group's offset. The fix gives each
+  group its own copy. It patches only when Luna's code has the expected shape (logs
+  `[LunaTools] Dynamic batching fix installed.` or why it skipped).
+
+Luna drops, before compiling, every class that no scene or asset references, and
+`[RuntimeInitializeOnLoadMethod]` does not count; files that declare an extension method are kept
+whole (they are listed under `ignores` in `LunaTemp/stage3/deps.json`), so each runtime fix declares
+one. Check `LunaTemp/stage3/processed-scripts/...` after a build to see what Luna kept.
+
 ## Changing the tool
 
 Edit it inside any project (`Assets/LunaTools`), then commit and push **in the
