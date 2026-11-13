@@ -58,7 +58,14 @@ over before Luna runs:
   `realtimeSinceStartup`, `DateTime` and the engine's clamp come out bit for bit the same.
 - Input: real mouse / touch / key events (and `luna_simulate`'s) are noted with the tick they precede, at
   full precision, and replayed as the same DOM events (canvas; keys on the engine keyboard's element).
-  Real input is ignored while a replay runs.
+  Mouse: every down / move / up, pressed or not and outside the playable too (a drag keeps going there),
+  with `buttons` and `which`: on a desktop the Dev Environment's `iframe.html` turns mouse events into
+  touches, only those with `which === 1` (a hover move has 0), so the replayed event carries the same;
+  coordinates keep their fractions (the `MouseEvent` constructor rounds them). Real input is ignored
+  while a replay runs.
+- Luna's own clock (what `Application._tick` reads) is `performance.now` minus the time Luna was paused
+  (`luna:pause` / `luna:resume`: focus, hidden tab). A replay blocks those events and replays the
+  recorded pause state tick by tick; each tick sets the clock with Luna's pause total (`frozen − _time`).
 - `Math.random` is seeded (seed stored); the page's Playground values (`window.playgroundOverrides`)
   are recorded and forced on replay unless turned off; the viewport is recorded and the Dev
   Environment's iframe is set to it.

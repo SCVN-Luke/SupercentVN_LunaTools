@@ -1306,7 +1306,10 @@
             // replay's sums and differences are exact and every Time.deltaTime matches the recording bit for bit.
             // After a replay (ahead of the real clock) or a recording, the clock runs on from where it stopped (offset).
             var perf = win.performance, realPerfNow = perf.now.bind(perf), RealDate = win.Date,
-                clock = { installed: false, frozen: null, offset: 0, t0: null, date0: null };
+                clock = { installed: false, frozen: null, offset: 0, t0: null, date0: null, engineOff: 0 };
+            // Luna's own clock (Application._tick reads it) is performance.now minus the time Luna was paused
+            // (luna:pause / luna:resume, e.g. a hidden tab). After a tick app._time holds it, so frozen - _time is that
+            // pause total (engineOff): a tick meant to be dt after the previous one sets the clock with it.
             function q(v) { return Math.round(v * 1024) / 1024; }
             function vNow() { return clock.frozen !== null ? clock.frozen : q(realPerfNow() + clock.offset); }
             function unfreeze() {
@@ -1423,18 +1426,25 @@
             }
 
             // ---------- Recording ----------
-            function recNote(ev) {
-                var last = rec.events[rec.events.length - 1];
-                if (ev[1] === 'm' && last && last[1] === 'm' && last[0] === ev[0]) rec.events[rec.events.length - 1] = ev;    // One move per tick.
-                else rec.events.push(ev);
-            }
-            function recPointer(kind, phase, x, y) {
+            // Every event is kept, several per tick included: the engine handles each one (mouse delta, last position).
+            function recNote(ev) { rec.events.push(ev); }
+            // Mouse: every down / move / up the page gets, pressed or not and inside the canvas or not. The engine listens
+            // on the window and keeps the last position from hover moves too, so a drag released outside the playable
+            // and the moves back in change what the game reads. buttons (moves) is the DOM state, replayed as is.
+            // Touch: from its start to its end (a touch exists only then).
+            function recPointer(kind, phase, x, y, buttons, which) {
                 if (!rec || !rec.running) return;
                 if (!rec.kind) rec.kind = kind;
-                if (phase === 'd') rec.down = true;
-                else if (!rec.down) return;                  // Moves count only while pressed.
-                if (phase === 'u') rec.down = false;
-                recNote([rec.dt.length, phase, x, y]);      // Full precision: the replay lands on the same pixel.
+                if (kind === 'touch') {
+                    if (phase === 'd') rec.down = true;
+                    else if (!rec.down) return;
+                    if (phase === 'u') rec.down = false;
+                }
+                var ev = [rec.dt.length, phase, x, y];      // Full precision: the replay lands on the same pixel.
+                // Mouse: buttons and which as the page saw them. The Dev Environment's touch emulation (iframe.html)
+                // turns mouse events into touches only when which === 1, so a replayed event must carry the same.
+                if (kind === 'mouse') ev.push(buttons | 0, which === undefined ? (phase === 'u' ? 1 : buttons ? 1 : 0) : which | 0);
+                recNote(ev);
             }
             function relative(clientX, clientY) {
                 var c = canvasOf(currentApp());
@@ -1462,9 +1472,8 @@
                     return;
                 }
                 if (e.button !== 0 && t !== 'mousemove') return;
-                if (t === 'mousedown' && e.target !== canvasOf(currentApp())) return;
                 var mp = relative(e.clientX, e.clientY);
-                if (mp) recPointer('mouse', t === 'mousedown' ? 'd' : t === 'mousemove' ? 'm' : 'u', mp.x, mp.y);
+                if (mp) recPointer('mouse', t === 'mousedown' ? 'd' : t === 'mousemove' ? 'm' : 'u', mp.x, mp.y, e.buttons, e.which);
             }
             // Runs one engine tick at the frozen clock and notes its raw delta (ms), time scale / pause changes and samples.
             // simDtMs: luna_simulate's fixed delta (the tick then starts that long after the previous one).
@@ -1483,11 +1492,12 @@
                     rec.events.push([k, 's', rec.scale, rec.paused]);
                 }
                 var at = q(realPerfNow() + clock.offset);
-                if (simDtMs !== undefined) a._time = at - q(simDtMs);
+                if (simDtMs !== undefined) a._time = at - clock.engineOff - q(simDtMs);
                 clock.frozen = Math.max(at, a._time);
                 var before = a._time;
                 run();
                 rec.dt.push(a._time - before);
+                if (!a.paused) clock.engineOff = clock.frozen - a._time;
                 rec.ms += Math.min(100, Math.max(0, a._time - before));
                 if ((k + 1) % SAMPLE_EVERY === 0) rec.samples.push(sample(a, k));
             }
@@ -1503,7 +1513,7 @@
                     return done;
                 });
                 return {
-                    format: 'luna-devtools-recording', version: 1,
+                    format: 'luna-devtools-recording', version: 2,     // 2: every mouse move (hover too) with its buttons.
                     name: rec.name, outcome: opts.outcome || '', createdAt: new Date().toISOString(),
                     page: { path: win.location.pathname, title: win.document.title },
                     input: rec.kind || 'mouse', viewport: rec.viewport || viewport(), seed: rec.seed,
@@ -1554,10 +1564,21 @@
                     c.dispatchEvent(new win.TouchEvent(type, { bubbles: true, cancelable: true, touches: live, targetTouches: live, changedTouches: [t] }));
                 } else {
                     var mtype = ev[1] === 'd' ? 'mousedown' : ev[1] === 'm' ? 'mousemove' : 'mouseup';
-                    c.dispatchEvent(new win.MouseEvent(mtype, { bubbles: true, cancelable: true, view: win, button: 0,
-                        buttons: mtype === 'mouseup' ? 0 : 1, clientX: cx, clientY: cy }));
+                    // buttons / which as recorded (hover moves: buttons 0); older recordings kept pressed moves only.
+                    var buttons = ev.length > 4 ? ev[4] : mtype === 'mouseup' ? 0 : 1;
+                    var me = new win.MouseEvent(mtype, { bubbles: true, cancelable: true, view: win, button: 0,
+                        buttons: buttons, clientX: cx, clientY: cy });
+                    // The constructor rounds coordinates down to whole pixels; a real event keeps fractions.
+                    var px = cx + (win.pageXOffset || 0), py = cy + (win.pageYOffset || 0);
+                    var exact = { clientX: cx, clientY: cy, x: cx, y: cy, pageX: px, pageY: py };
+                    if (ev.length > 5) exact.which = ev[5];
+                    Object.keys(exact).forEach(function (key) {
+                        try { Object.defineProperty(me, key, { configurable: true, get: function () { return exact[key]; } }); } catch (e) { /* Kept as built. */ }
+                    });
+                    c.dispatchEvent(me);
                 }
-                rp.pressed = ev[1] === 'u' ? null : ev;
+                if (ev[1] === 'd') rp.pressed = ev;
+                else if (ev[1] === 'u') rp.pressed = null;
             }
             function blockRealInput(e) {
                 if (rp && rp.running && e.isTrusted && !isPanel(e) && !(e.type === 'keydown' && e.key === '`')) {
@@ -1586,9 +1607,10 @@
                         var k = rp.k;
                         while (rp.ev < rec0.events.length && rec0.events[rp.ev][0] <= k) fireEvent(a, rec0.events[rp.ev++]);
                         var next = rp.v + rec0.dt[k];        // Exact: multiples of 1/1024 ms.
-                        clock.frozen = next;
+                        clock.frozen = next + clock.engineOff;
                         a._time = rp.v;
                         a.tick(next);
+                        if (a._time !== next && !a.paused) clock.engineOff = clock.frozen - a._time;   // Luna paused its clock.
                         rp.v = next;
                         rp.ms += Math.min(100, Math.max(0, rec0.dt[k]));
                         rp.k++;
@@ -1598,6 +1620,8 @@
                                 var why = differs(want, s);
                                 if (why) rp.divergence = { tick: k, seconds: r3(rp.ms / 1000), why: why, recorded: want, replayed: s };
                             }
+                            if (want && !rp.inexact && JSON.stringify(want) !== JSON.stringify(s))
+                                rp.inexact = { tick: k, seconds: r3(rp.ms / 1000), recorded: want, replayed: s };
                         }
                         while (rp.shots.length && rp.shots[0].tick <= k) {
                             var shot = rp.shots.shift();
@@ -1636,6 +1660,7 @@
                     passed: complete && !rp.failure && checks.every(function (c) { return c.pass; }),
                     checks: checks,
                     divergence: rp.divergence || null,
+                    firstInexact: rp.inexact || null,         // First sample not equal to the recording (no tolerance).
                     final: complete ? { recorded: rec0.final || null, replayed: final, differs: differs(rec0.final, final),
                         identical: !!rec0.final && JSON.stringify(rec0.final) === JSON.stringify(final) } : null,
                     config: rp.applyConfig ? { applied: true, pageHadOverrides: rp.shellOverrides !== undefined }
@@ -1671,6 +1696,11 @@
                 };
                 ['mousedown', 'mousemove', 'mouseup', 'touchstart', 'touchmove', 'touchend', 'touchcancel', 'keydown', 'keyup'].forEach(function (t) {
                     win.addEventListener(t, mode === 'record' ? onRecordEvent : blockRealInput, true);
+                });
+                // Replay: Luna's own pause / resume (focus, hidden tab) would move its clock at other ticks than in the
+                // recording; the recorded pause state is replayed tick by tick instead (app.paused).
+                if (mode === 'replay') ['luna:pause', 'luna:resume'].forEach(function (t) {
+                    win.addEventListener(t, function (e) { if (rp && rp.running) e.stopImmediatePropagation(); }, true);
                 });
             }
             if (mode === 'record') {
@@ -1778,7 +1808,7 @@
                 remove: function (name) { return post({ action: 'delete', name: name }); },
                 replaying: function () { return !!(rp && rp.running); },
                 // luna_simulate's input and ticks while recording.
-                simEvent: function (kind, phase, x, y) { recPointer(kind, phase, x, y); },
+                simEvent: function (kind, phase, x, y) { recPointer(kind, phase, x, y, phase === 'u' ? 0 : 1, 1); },
                 // One luna_simulate tick of dtMs: recorded when a recording runs, on the page's clock (virtual or real).
                 simTick: function (a, dtMs) {
                     if (rec && rec.running) { recTick(a, function () { a.tick(); }, dtMs); return; }
