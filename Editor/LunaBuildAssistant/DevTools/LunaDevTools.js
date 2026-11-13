@@ -1677,6 +1677,7 @@
                 if (!rec0.clock) lastResult.note = (lastResult.note ? lastResult.note + ' ' : '') +
                     'Recorded before the virtual clock: record it again for an exact replay.';
                 unfreeze();                          // The clock runs on from the replay's last tick.
+                setTimeout(flushSync, 0);            // Luna's tracer sync held during the replay.
                 engineRaf.call(win, a.tick);        // Back to the browser's own frames.
                 var list = waiters;
                 waiters = [];
@@ -1735,6 +1736,36 @@
                 }
             }
 
+            // Luna's develop tracer (engine/luna/script-1.js, window.traceResults): after each save it fetches luna.json and
+            // Bridge.unroll()s the classes earlier sessions used, which runs their static constructors whenever that fetch
+            // lands. Before the scene has loaded, a constructor that creates a GameObject throws ($scene is not defined) and
+            // its class stays broken for the session (e.g. SimpleTransform.ST, every tween); during a recording / replay it
+            // runs at a random tick. So it waits for the scene, and for the end of a recording / replay. It still runs:
+            // runtime analysis records the same classes.
+            var sync = { run: null, pending: false };
+            function flushSync() {
+                if (!sync.pending || !sync.run || (rec && rec.running) || (rp && rp.running)) return;
+                if (!win.$scene) { setTimeout(flushSync, 100); return; }
+                sync.pending = false;
+                try { sync.run(); } catch (e) { fail('tracer sync', e); }
+            }
+            try {
+                var tracer;
+                Object.defineProperty(win, 'traceResults', {
+                    configurable: true, enumerable: true,
+                    get: function () { return tracer; },
+                    set: function (v) {
+                        tracer = v;
+                        if (v && typeof v.syncBackWithLuna === 'function' && !v.__lunaDevToolsSync) {
+                            var original = v.syncBackWithLuna;
+                            sync.run = function () { return original.call(v); };
+                            v.syncBackWithLuna = function () { sync.pending = true; flushSync(); };
+                            v.__lunaDevToolsSync = true;
+                        }
+                    }
+                });
+            } catch (e) { fail('tracer sync hook', e); }
+
             function post(body) {
                 return win.fetch(RECORDINGS_ROUTE, { method: 'POST', cache: 'no-store', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
                     .then(function (r) { return r.json(); }).then(function (j) { if (j.error) throw new Error(j.error); return j; });
@@ -1764,6 +1795,7 @@
                     if (!rec.started) return Promise.reject(new Error('The engine has not run a frame yet.'));
                     rec.running = false;
                     unfreeze();
+                    setTimeout(flushSync, 0);
                     var recording = recordingObject(opts || {});
                     if (opts && opts.save === false) return Promise.resolve({ recording: recording });
                     return post({ action: 'save', recording: recording }).then(function (j) {
@@ -1771,7 +1803,7 @@
                             input: recording.input, checks: recording.checks, outcome: recording.outcome, viewport: recording.viewport };
                     });
                 },
-                cancel: function () { if (rec) { rec.running = false; unfreeze(); } },
+                cancel: function () { if (rec) { rec.running = false; unfreeze(); setTimeout(flushSync, 0); } },
                 replay: function (nameOrRecording, opts) {
                     var go = function (recording) {
                         if (!recording || !Array.isArray(recording.dt)) throw new Error('Not a recording (no dt list).');

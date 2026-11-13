@@ -72,6 +72,13 @@ over before Luna runs:
 - Every 30 ticks a sample (main camera position, active objects, draw calls) is stored; a replay
   compares them and reports the first difference, and the final state (`identical`).
 
+- Luna's develop tracer (`engine/luna/script-1.js`) fetches `luna.json` after each save and
+  `Bridge.unroll()`s the classes earlier sessions used, running their static constructors whenever that
+  fetch lands: before the scene has loaded one that creates a GameObject throws (`$scene is not
+  defined`, e.g. `SimpleTransform.ST`: tweens broken for the whole session), during a recording /
+  replay it runs at a random tick. The Dev Tools hold that step until the scene exists, and until a
+  recording / replay ends (every page, not only recordings); runtime analysis records the same classes.
+
 Still outside it: audio playback (real time), and code seeded from anything else. Re-record a preset
 after gameplay changes. During these loads the engine's own frame timings read 0 (frozen clock).
 
