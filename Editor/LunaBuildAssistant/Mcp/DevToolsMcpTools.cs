@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 
 namespace Supercent.Util.Editor
@@ -20,7 +21,8 @@ namespace Supercent.Util.Editor
             "then luna_get_errors / luna_screenshot.\n" +
             "- Test with recorded plays: luna_recordings lists the input presets saved in the project (e.g. 'full flow - win'); luna_replay " +
             "replays one from a fresh start tick by tick (same deltas, seeded random, recorded Playground values) and returns pass / fail of " +
-            "its end checks, where it starts to differ from the recording, errors and screenshots. luna_record records a new one (the user " +
+            "its end checks, where it starts to differ from the recording, errors and screenshots; captureEvery records the screen (frames, " +
+            "contact sheets and a player page on disk) to review motion, feedback and pacing. luna_record records a new one (the user " +
             "plays, or luna_simulate steps).\n" +
             "- Performance: luna_get_stats (frame time, draw calls, heap), luna_record_hot_paths (cost per script callback / coroutine and the " +
             "methods called inside, while the game is played), luna_capture_frame (draw calls of one frame).\n" +
@@ -282,7 +284,10 @@ namespace Supercent.Util.Editor
                               "recorded size). Returns passed (all end checks true), each check, where the state first differs from the " +
                               "recording (camera / active objects, sampled every 0.5 s), errors logged and screenshots at the asked seconds. " +
                               "Random code not driven by Math.random (e.g. DateTime seeds) can still make a replay differ. Runs game code like " +
-                              "real play; the user's own input is ignored while it runs.",
+                              "real play; the user's own input is ignored while it runs. Screen capture: captureEvery (seconds of play) records a " +
+                              "frame that often (captureFrom / captureTo limit it) and writes them to Library/LunaDevTools/Captures/<recording> " +
+                              "<time>/ with index.html (a player: play at real speed, scrub, step, slow down) and contact sheets (grids of " +
+                              "frames with their play time; the first ones come back as images when captureSheetsInline > 0).",
                 ReadOnly = false,
                 InputSchema = McpServer.Schema(new Dictionary<string, object>
                 {
@@ -300,6 +305,14 @@ namespace Supercent.Util.Editor
                     { "applyConfig", McpServer.Prop("boolean", "Force the recording's Playground values (default true)", true) },
                     { "matchViewport", McpServer.Prop("boolean", "Set the page's iframe to the recorded size first (default true)", true) },
                     { "waitSeconds", McpServer.Prop("number", "How long to wait for the replay to end (after the reload)", 180) },
+                    { "captureEvery", McpServer.Prop("number", "Screen capture: one frame every this many seconds of play (e.g. 0.1); off when not given") },
+                    { "captureFrom", McpServer.Prop("number", "Screen capture starts at this play time (seconds)", 0) },
+                    { "captureTo", McpServer.Prop("number", "Screen capture ends at this play time (seconds; default: the end)") },
+                    { "captureWidth", McpServer.Prop("integer", "Width of captured frames", 360) },
+                    { "sheetColumns", McpServer.Prop("integer", "Contact sheets: frames per row", 6) },
+                    { "sheetRows", McpServer.Prop("integer", "Contact sheets: rows per sheet", 4) },
+                    { "sheetStride", McpServer.Prop("integer", "Contact sheets: use every Nth captured frame (the player keeps all)", 1) },
+                    { "captureSheetsInline", McpServer.Prop("integer", "Return this many contact sheets as images (0 = paths only)", 0) },
                 }, "name"),
                 Run = args =>
                 {
@@ -317,11 +330,23 @@ namespace Supercent.Util.Editor
                     };
                     if (args.ContainsKey("stopAtSeconds"))
                         start["stopAtSeconds"] = MiniJson.Num(args, "stopAtSeconds", 0);
+                    double every = MiniJson.Num(args, "captureEvery", 0);
+                    if (every > 0)
+                        start["capture"] = new Dictionary<string, object>
+                        {
+                            { "every", every }, { "from", MiniJson.Num(args, "captureFrom", 0) }, { "to", MiniJson.Num(args, "captureTo", 0) },
+                            { "maxWidth", MiniJson.Num(args, "captureWidth", 360) },
+                        };
                     var armed = MiniJson.Obj(channel.Send(id, "replayStart", start, 15000));
                     channel.WaitForLoad(id, MiniJson.Str(armed, "previousLoadId"), 90000);
                     int waitMs = (int)(Math.Max(10, Math.Min(900, MiniJson.Num(args, "waitSeconds", 180))) * 1000);
                     var result = MiniJson.Obj(channel.Send(id, "replayResult", new Dictionary<string, object> { { "timeoutMs", waitMs } }, waitMs + 10000));
-                    return WithScreenshots(result);
+                    var sheets = every > 0 ? SaveCapture(channel, id, name, every, args, result) : null;
+                    var output = WithScreenshots(result);
+                    if (sheets != null)
+                        foreach (string b64 in sheets)
+                            output.WithImage(b64, "image/jpeg");
+                    return output;
                 },
             });
 
@@ -377,6 +402,70 @@ namespace Supercent.Util.Editor
                     }
                 },
             });
+        }
+
+        // Captured frames of the replay just finished: read from the page in chunks, written to disk with a player page and
+        // contact sheets; result["capture"] gets the paths. Returns the contact sheets to show inline.
+        static List<string> SaveCapture(DevToolsChannel channel, string id, string name, double every,
+                                        Dictionary<string, object> args, Dictionary<string, object> result)
+        {
+            var inline = new List<string>();
+            if (result == null)
+                return inline;
+            var info = MiniJson.Obj(result.TryGetValue("capture", out object c) ? c : null) ?? new Dictionary<string, object>();
+            try
+            {
+                string dir = LunaCaptures.NewFolder(name);
+                var frames = new List<Dictionary<string, object>>();
+                int total = int.MaxValue;
+                for (int offset = 0; offset < total;)
+                {
+                    var chunk = MiniJson.Obj(channel.Send(id, "captureFrames", new Dictionary<string, object> { { "offset", offset }, { "count", 40 } }, 30000));
+                    total = (int)MiniJson.Num(chunk, "total", 0);
+                    var list = chunk.TryGetValue("frames", out object fl) && fl is List<object> l ? l : new List<object>();
+                    if (list.Count == 0)
+                        break;
+                    foreach (var f in list.Select(MiniJson.Obj).Where(x => x != null))
+                    {
+                        double seconds = MiniJson.Num(f, "seconds", 0);
+                        string file = LunaCaptures.FrameFile(frames.Count, seconds);
+                        LunaCaptures.WriteJpeg(Path.Combine(dir, file), MiniJson.Str(f, "base64"));
+                        frames.Add(new Dictionary<string, object> { { "file", file }, { "seconds", seconds }, { "tick", f.TryGetValue("tick", out object t) ? t : null } });
+                    }
+                    offset += list.Count;
+                }
+                string player = LunaCaptures.WritePlayer(dir, name, every, frames);
+                var sheetFiles = new List<object>();
+                if (frames.Count > 0)
+                {
+                    var sheets = MiniJson.Obj(channel.Send(id, "captureSheets", new Dictionary<string, object>
+                    {
+                        { "cols", MiniJson.Num(args, "sheetColumns", 6) }, { "rows", MiniJson.Num(args, "sheetRows", 4) },
+                        { "stride", MiniJson.Num(args, "sheetStride", 1) },
+                    }, 60000));
+                    int want = (int)MiniJson.Num(args, "captureSheetsInline", 0), n = 0;
+                    foreach (var sh in (sheets.TryGetValue("sheets", out object sl) && sl is List<object> s2 ? s2 : new List<object>()).Select(MiniJson.Obj).Where(x => x != null))
+                    {
+                        string file = string.Format(System.Globalization.CultureInfo.InvariantCulture, "sheet_{0:00}_{1:0.00}-{2:0.00}s.jpg",
+                            ++n, MiniJson.Num(sh, "from", 0), MiniJson.Num(sh, "to", 0));
+                        LunaCaptures.WriteJpeg(Path.Combine(dir, file), MiniJson.Str(sh, "base64"));
+                        sheetFiles.Add(Path.Combine(dir, file));
+                        if (inline.Count < want)
+                            inline.Add(MiniJson.Str(sh, "base64"));
+                    }
+                }
+                info["folder"] = dir;
+                info["player"] = player;
+                info["frames"] = frames.Count;
+                info["sheets"] = sheetFiles;
+                info.Remove("note");
+            }
+            catch (Exception e)
+            {
+                info["error"] = "Capture not saved: " + e.Message;
+            }
+            result["capture"] = info;
+            return inline;
         }
 
         // Replay result: screenshots become images, the JSON keeps where they were taken.

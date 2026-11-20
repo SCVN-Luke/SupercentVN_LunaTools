@@ -1261,7 +1261,7 @@
         function stackHere() { return new Error().stack || ''; }
 
         // JPEG of the canvas. redraw: draw the current state first (the buffer is only valid in the task that drew it).
-        function grab(maxWidth, redrawFirst) {
+        function grab(maxWidth, redrawFirst, quality) {
             var canvas = agent.gl.canvas();
             if (!canvas) throw new Error('No WebGL canvas yet.');
             if (redrawFirst) redraw();
@@ -1270,7 +1270,7 @@
             copy.width = w;
             copy.height = h;
             copy.getContext('2d').drawImage(canvas, 0, 0, w, h);
-            var url = copy.toDataURL('image/jpeg', 0.85), a = getApp();
+            var url = copy.toDataURL('image/jpeg', quality || 0.85), a = getApp();
             return { base64: url.slice(url.indexOf(',') + 1), mimeType: 'image/jpeg', width: w, height: h, frame: a ? a.frame : 0 };
         }
 
@@ -1586,6 +1586,16 @@
                     if (e.cancelable && e.type.indexOf('touch') !== 0) e.preventDefault();
                 }
             }
+            function captureTick(k) {
+                var c = rp.capture;
+                if (!c || rp.ms < c.next || rp.ms > c.to * 1000 + 0.5) return;
+                if (c.frames.length >= c.maxFrames) { c.dropped++; c.next = rp.ms + c.every * 1000; return; }
+                try {
+                    var g = grab(c.maxWidth, false, c.quality);
+                    c.frames.push({ seconds: r3(rp.ms / 1000), tick: k, width: g.width, height: g.height, base64: g.base64 });
+                } catch (e) { c.dropped++; }
+                while (c.next <= rp.ms) c.next += c.every * 1000;    // Next sample time (skips when a tick is longer than the step).
+            }
             function startReplay(a) {
                 if (rp.started) return;
                 rp.started = true;
@@ -1630,6 +1640,7 @@
                                 rp.images.push({ seconds: shot.seconds, tick: k, width: g.width, height: g.height, base64: g.base64, mimeType: g.mimeType });
                             } catch (e) { /* No canvas. */ }
                         }
+                        captureTick(k);
                         if (realNow() > budget) break;
                     }
                 } catch (e) {
@@ -1671,6 +1682,9 @@
                         top: errors.slice(0, 8).map(function (e) { return { level: e.level, count: e.count, message: e.message.slice(0, 300), firstFrame: e.firstFrame }; }) },
                     screenshots: rp.images
                 };
+                if (rp.capture) lastResult.capture = { frames: rp.capture.frames.length, every: rp.capture.every, from: rp.capture.from,
+                    to: rp.capture.to === Infinity ? null : rp.capture.to, width: rp.capture.maxWidth, dropped: rp.capture.dropped,
+                    note: 'Read the frames with captureFrames (luna_replay writes them to disk).' };
                 if (rp.failure) lastResult.failure = rp.failure;
                 if (rp.stopAt && rp.k < rec0.dt.length) lastResult.note = 'Stopped at ' + lastResult.seconds + ' s as asked (stopAtSeconds): checks run only at the end.';
                 if (rp.pressed && complete) lastResult.note = (lastResult.note ? lastResult.note + ' ' : '') + 'The recording ends with the pointer still down.';
@@ -1723,6 +1737,15 @@
                 rp = { running: true, started: false, rec: r0, k: 0, ev: 0, end: end, ms: 0, speed: Math.max(0, +o.speed || 0),
                     applyConfig: o.applyConfig !== false, maxWidth: o.maxWidth || 360, stopAt: stopAt, shots: shots, images: [],
                     samplesByTick: byTick, divergence: null, kind: r0.input || 'mouse', pressed: null };
+                // Screen capture: one frame every capture.every seconds of play (play time = recorded deltas, so a hit
+                // stop or slow motion shows as it looked), kept in the page and read in chunks (captureFrames).
+                var cap = o.capture;
+                if (cap && +cap.every > 0) {
+                    var cFrom = Math.max(0, +cap.from || 0), cTo = +cap.to > 0 ? +cap.to : Infinity;
+                    rp.capture = { every: Math.max(1 / 60, +cap.every), from: cFrom, to: cTo, next: cFrom,
+                        maxWidth: Math.max(64, Math.min(1080, +cap.maxWidth || 360)), quality: Math.max(0.3, Math.min(0.95, +cap.quality || 0.8)),
+                        maxFrames: Math.max(1, Math.min(3000, +cap.maxFrames || 1500)), frames: [], dropped: 0 };
+                }
                 seedRandom(r0.seed >>> 0);
                 if (rp.applyConfig && r0.config && r0.config.playgroundOverrides) {
                     var forced = r0.config.playgroundOverrides;
@@ -1834,6 +1857,52 @@
                     });
                 },
                 last: function () { return lastResult; },
+                // Captured frames of the last replay, [offset, offset + count).
+                frames: function (offset, count) {
+                    var c = rp && rp.capture;
+                    if (!c) throw new Error('The last replay captured no frames (luna_replay with capture).');
+                    offset = Math.max(0, offset | 0);
+                    count = Math.max(1, Math.min(200, count | 0 || 40));
+                    return { total: c.frames.length, offset: offset, frames: c.frames.slice(offset, offset + count) };
+                },
+                // Contact sheets of the captured frames: a grid of thumbnails with their play time, JPEG each.
+                sheets: function (o) {
+                    var c = rp && rp.capture;
+                    if (!c || !c.frames.length) return Promise.reject(new Error('The last replay captured no frames.'));
+                    o = o || {};
+                    var cols = Math.max(1, Math.min(12, o.cols | 0 || 6)), rows = Math.max(1, Math.min(12, o.rows | 0 || 4));
+                    var stride = Math.max(1, o.stride | 0 || 1), tw = Math.max(48, Math.min(400, o.thumbWidth | 0 || 160));
+                    var pick = c.frames.filter(function (f, i) { return i % stride === 0; }), per = cols * rows, out = [];
+                    function load(f) {
+                        return new Promise(function (resolve) {
+                            var img = new win.Image();
+                            img.onload = function () { resolve(img); };
+                            img.onerror = function () { resolve(null); };
+                            img.src = 'data:image/jpeg;base64,' + f.base64;
+                        });
+                    }
+                    var chain = Promise.resolve();
+                    for (var s0 = 0; s0 < pick.length; s0 += per) (function (group) {
+                        chain = chain.then(function () { return Promise.all(group.map(load)); }).then(function (imgs) {
+                            var f0 = group[0], th = Math.round(f0.height * tw / f0.width), pad = 4, label = 16;
+                            var cv = win.document.createElement('canvas');
+                            cv.width = cols * (tw + pad) + pad;
+                            cv.height = Math.ceil(group.length / cols) * (th + label + pad) + pad;
+                            var g = cv.getContext('2d');
+                            g.fillStyle = '#111'; g.fillRect(0, 0, cv.width, cv.height);
+                            g.font = 'bold 12px sans-serif'; g.textBaseline = 'top';
+                            imgs.forEach(function (img, i) {
+                                var x = pad + (i % cols) * (tw + pad), y = pad + Math.floor(i / cols) * (th + label + pad);
+                                g.fillStyle = '#ddd'; g.fillText(group[i].seconds.toFixed(2) + ' s', x + 2, y + 1);
+                                if (img) g.drawImage(img, x, y + label, tw, th);
+                            });
+                            var url = cv.toDataURL('image/jpeg', 0.8);
+                            out.push({ from: group[0].seconds, to: group[group.length - 1].seconds, frames: group.length,
+                                width: cv.width, height: cv.height, base64: url.slice(url.indexOf(',') + 1) });
+                        });
+                    })(pick.slice(s0, s0 + per));
+                    return chain.then(function () { return { sheets: out, stride: stride }; });
+                },
                 list: function () {
                     return win.fetch(RECORDINGS_ROUTE, { cache: 'no-store' }).then(function (r) { return r.json(); });
                 },
@@ -2061,8 +2130,10 @@
             },
             replayStart: function (p) {
                 return inputs.replay(p.name, { speed: p.speed, applyConfig: p.applyConfig, matchViewport: p.matchViewport,
-                    screenshots: p.screenshotsAt, maxWidth: p.maxWidth, stopAtSeconds: p.stopAtSeconds });
+                    screenshots: p.screenshotsAt, maxWidth: p.maxWidth, stopAtSeconds: p.stopAtSeconds, capture: p.capture });
             },
+            captureFrames: function (p) { return inputs.frames(p.offset, p.count); },
+            captureSheets: function (p) { return inputs.sheets(p); },
             replayResult: function (p) { return inputs.result(Math.max(1000, +p.timeoutMs || 120000)); },
 
             reload: function () {

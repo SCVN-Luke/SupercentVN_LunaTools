@@ -43,6 +43,11 @@ restart, activate a GameObject by name (end card). The phone URL is shown in the
   the project (outside `Assets`, never shipped; commit it to share) with an expected-result label and the
   end check (default: the end card object's active state at the stop). ▶ replays one (Fast / ×1 / ×2 / ×4)
   and shows PASS / FAIL, the checks, where it first differs from the recording, and errors.
+- Screen capture (agents: `luna_replay` with `captureEvery`): a replay grabs one frame every N seconds of
+  play (`captureFrom` / `captureTo` limit it; play time, so hit stops and slow motion look as played) and
+  writes them to `Library/LunaDevTools/Captures/<recording> <time>/`: the JPEG frames, `frames.json`,
+  contact sheets (grids of frames with their play time) and `index.html`, a player (play at real speed,
+  scrub, step with the arrow keys, ×0.1-×2). Library keeps them out of Git and out of the build.
 
 ### How a replay stays exact
 
