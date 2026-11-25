@@ -61,6 +61,7 @@ namespace Supercent.Util.Editor
             if (!LunaPluginBridge.ClearShaderVariants())
                 Debug.LogWarning("[LunaBuildAssistant] Assets/SVC_Luna.asset not found; shader variant lists were not cleared.");
             LunaPluginBridge.SaveUploadTarget(appId, conceptName);
+            StripGuard.Enforce();                   // Nothing stripped beyond the last upload, whatever the last session marked.
             ProjectBuildState.LastApplicationId = appId;
             LunaPluginBridge.BuildAndUpload(appId, creativeId);
             StrippedCodeCheck.SaveBaseline();       // What this upload strips no longer counts as new.

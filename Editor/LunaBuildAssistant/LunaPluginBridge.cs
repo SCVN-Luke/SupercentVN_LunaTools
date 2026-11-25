@@ -137,8 +137,8 @@ namespace Supercent.Util.Editor
         }
 
         // Same as unticking entries in the plugin's code Analysis tree: the cloud build keeps them.
-        // Entries are "Class" (unusedClasses) or "Class#member" (unusedMethods); excluded only ever goes
-        // true -> false when the plugin merges a play session, so a kept entry stays kept.
+        // Entries are "Class" (unusedClasses) or "Class#member" (unusedMethods). A later Build Develop session can
+        // mark a kept entry unused again (seen on Luna 7.2: lists rewritten from one partial play); StripGuard undoes that.
         public static int KeepCode(ICollection<string> entries)
         {
             object config = Config() ?? throw new InvalidOperationException("LunaData (luna.json) not found");
@@ -164,6 +164,41 @@ namespace Supercent.Util.Editor
             if (kept > 0)
                 Call(Shapes.SaveConfig, null, SaveDefine);
             return kept;
+        }
+
+        // Entries the plugin's in-memory LunaData marks excluded ("Class" / "Class#member"): what the next save writes
+        // and the next build strips, even before luna.json on disk shows it. Null when LunaData is not loaded.
+        public static HashSet<string> StrippedCode()
+        {
+            object config = Config();
+            if (config == null)
+                return null;
+            object unity = Field(config, "unity");
+            var result = new HashSet<string>(StringComparer.Ordinal);
+            FieldInfo name = null, excluded = null, className = null, instance = null, statics = null, methodName = null, methodExcluded = null;
+            foreach (object c in (IEnumerable)Field(unity, "unusedClasses"))
+            {
+                name ??= FieldOf(c, "name");
+                excluded ??= FieldOf(c, "excluded");
+                if ((bool)excluded.GetValue(c))
+                    result.Add((string)name.GetValue(c));
+            }
+            foreach (object type in (IEnumerable)Field(unity, "unusedMethods"))
+            {
+                className ??= FieldOf(type, "className");
+                instance ??= FieldOf(type, "instanceMethods");
+                statics ??= FieldOf(type, "staticMethods");
+                string owner = (string)className.GetValue(type);
+                foreach (FieldInfo list in new[] { instance, statics })
+                    foreach (object m in (IEnumerable)list.GetValue(type) ?? new object[0])
+                    {
+                        methodName ??= FieldOf(m, "name");
+                        methodExcluded ??= FieldOf(m, "excluded");
+                        if ((bool)methodExcluded.GetValue(m))
+                            result.Add(owner + "#" + (string)methodName.GetValue(m));
+                    }
+            }
+            return result;
         }
 
         public static async Task<bool> BuildDevelop()

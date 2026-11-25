@@ -24,6 +24,17 @@ Commit the submodule, `.gitmodules` and `Assets/LunaTools.meta`.
 
 Cloning a project: `git clone --recurse-submodules …`, or `git submodule update --init` afterwards.
 
+## Code strip list lock (Tools/Luna/Lock Code Strip List, on by default)
+
+Luna strips every C# method / class that luna.json `unity.unusedMethods` / `unusedClasses` marks
+`excluded:true`, and Build Develop sessions merge what one play called into that list: a short or
+partial play marks late-game code unused, and the next cloud build strips code that still runs
+("stripped but still called" in the upload checks). `StripGuard` checks the plugin's LunaData every
+5 s and right before Build & upload, and keeps every entry marked excluded that the last upload did
+not strip (`Library/SupercentVN/LunaStripBaseline.json`; before the first upload, the committed
+luna.json). The strip list can then only shrink. "Strip OK" in the upload checks still adds entries to
+the baseline on purpose; turn the menu item off to let sessions strip new code again.
+
 ## Dev Tools (Build Develop debug panel)
 
 Build Develop → "Open with Dev Tools" (on by default) opens the playable through a local proxy

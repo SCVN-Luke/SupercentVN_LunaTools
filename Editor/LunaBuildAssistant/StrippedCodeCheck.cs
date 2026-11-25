@@ -69,6 +69,7 @@ namespace Supercent.Util.Editor
 
         static string ProjectRoot => Directory.GetParent(Application.dataPath).FullName;
         public static string LunaJsonPath => Path.Combine(ProjectRoot, LunaJsonFile);
+        internal static string BaselinePath => Path.Combine(ProjectRoot, BaselineFile);
 
         public static Report Run()
         {
@@ -102,7 +103,7 @@ namespace Supercent.Util.Editor
         }
 
         // "Class" for stripped classes, "Class#member" for stripped methods; ran = member groups called in some session.
-        static HashSet<string> StrippedEntries(string json, out HashSet<string> ran)
+        internal static HashSet<string> StrippedEntries(string json, out HashSet<string> ran)
         {
             var result = new HashSet<string>(StringComparer.Ordinal);
             ran = new HashSet<string>(StringComparer.Ordinal);
@@ -336,7 +337,7 @@ namespace Supercent.Util.Editor
             return map;
         }
 
-        static HashSet<string> LoadBaseline(out string source)
+        internal static HashSet<string> LoadBaseline(out string source)
         {
             Baseline saved = ReadSaved();
             if (saved?.entries != null)
